@@ -213,21 +213,19 @@ async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
 
 
 async def get_user_id(env) -> Optional[str]:
-    """Spotify user_id 를 반환하는 함수.
+    """현재 토큰의 Spotify user_id 를 반환하는 함수.
 
-    KV 에 있으면 그대로 쓰고, 없으면 /me 로 조회해 KV 에 저장한 뒤 반환한다.
-    (콜백 때 저장에 실패했더라도 플레이리스트 조회/생성이 동작하도록 자가 복구.)
+    항상 /me 로 현재 토큰 주인의 id 를 조회해 KV 에 최신화한다. (재인증으로 계정이
+    바뀌었을 때 KV 의 옛 user_id 를 그대로 쓰면 플레이리스트 생성이 403/404 로
+    실패하므로, 신선한 값을 사용한다.) /me 가 실패하면 KV 의 마지막 값으로 폴백한다.
     """
-    user_id: Optional[str] = await env.SPOTIFY_KV.get(KV_USER)
-    if user_id:
-        return user_id
     status, data = await spotify_api(env, "GET", "/me")
     if status == 200 and data.get("id"):
-        user_id = data["id"]
+        user_id: str = data["id"]
         await env.SPOTIFY_KV.put(KV_USER, user_id)
         return user_id
-    console.log("사용자 정보 조회 실패 status=" + str(status))
-    return None
+    console.log("/me 조회 실패 status=" + str(status) + ", KV 값으로 폴백")
+    return await env.SPOTIFY_KV.get(KV_USER)
 
 
 async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
@@ -260,12 +258,15 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
     return 200, result
 
 
-async def create_playlist(env, name: str) -> Optional[str]:
-    """새 공개 플레이리스트를 만들고 그 id 를 반환하는 함수."""
+async def create_playlist(env, name: str) -> Tuple[Optional[str], int, str]:
+    """새 공개 플레이리스트를 만들고 (id, 상태코드, 오류메시지)를 반환하는 함수.
+
+    성공 시 (playlist_id, 201, ""), 실패 시 (None, status, 사람이 읽을 오류).
+    """
     user_id: Optional[str] = await get_user_id(env)
     if not user_id:
-        console.log("user_id 를 확인할 수 없어 플레이리스트를 생성할 수 없습니다.")
-        return None
+        return None, 0, "사용자 정보를 확인할 수 없습니다. /login 으로 다시 인증하세요."
+
     body: Dict[str, Any] = {
         "name": name,
         "public": True,
@@ -273,9 +274,16 @@ async def create_playlist(env, name: str) -> Optional[str]:
     }
     status, data = await spotify_api(env, "POST", "/users/" + user_id + "/playlists", json_body=body)
     if status not in (200, 201):
-        console.log("플레이리스트 생성 실패 status=" + str(status))
-        return None
-    return data.get("id")
+        console.log("플레이리스트 생성 실패 status=" + str(status) + " body=" + json.dumps(data))
+        msg: str = "Spotify 생성 실패 (status " + str(status) + ")"
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict) and err.get("message"):
+            msg += ": " + str(err["message"])
+        if status == 403:
+            msg += " — 스코프 부족 또는 다른 계정의 사용자 id 입니다. /login 으로 다시 인증하세요."
+        return None, status, msg
+
+    return data.get("id"), status, ""
 
 
 # --- 플레이리스트 쓰기 -----------------------------------------------------
@@ -526,9 +534,10 @@ async def handle_fetch(request, env) -> Response:
     if path == "/create" and method == "POST":
         body = await read_json(request)
         name: str = body.get("name") or "좋아요 미러"
-        new_id: Optional[str] = await create_playlist(env, name)
+        new_id, cstatus, cerr = await create_playlist(env, name)
         if not new_id:
-            return json_response({"ok": False, "error": "플레이리스트 생성 실패"}, status=400)
+            http_status = cstatus if cstatus in (401, 403, 404) else 400
+            return json_response({"ok": False, "error": cerr or "플레이리스트 생성 실패"}, status=http_status)
         await env.SPOTIFY_KV.put(KV_PLAYLIST, new_id)
         await env.SPOTIFY_KV.delete(KV_LAST_TIME)
         await env.SPOTIFY_KV.delete(KV_LAST_COUNT)
