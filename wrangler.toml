@@ -1,0 +1,27 @@
+name = "spotify-sync"
+main = "src/worker.py"
+compatibility_date = "2025-05-26"
+compatibility_flags = ["python_workers"]
+
+# 매일 00:00 UTC 자동 동기화
+[triggers]
+crons = ["0 0 * * *"]
+
+# 커스텀 도메인 (spotify.vialinks.xyz)
+[[routes]]
+pattern = "spotify.vialinks.xyz"
+custom_domain = true
+
+# KV 네임스페이스 바인딩
+[[kv_namespaces]]
+binding = "SPOTIFY_KV"
+id = "226fd06df76548a2aa8477fba7c06691"
+
+# 환경변수 (공개 가능 값만). SPOTIFY_CLIENT_SECRET 은 secret 으로 별도 주입.
+[vars]
+SPOTIFY_CLIENT_ID = "d87978f9aec64e5d9f45a7dc06ce98ca"
+
+# 관측 가능성 (로그 전체 수집)
+[observability]
+enabled = true
+head_sampling_rate = 1.0
