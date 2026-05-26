@@ -41,6 +41,7 @@ KV_USER: str = "spotify:user_id"
 KV_PLAYLIST: str = "spotify:playlist_id"
 KV_LAST_TIME: str = "spotify:last_sync_time"
 KV_LAST_COUNT: str = "spotify:last_sync_count"
+KV_SCOPE: str = "spotify:scope"
 
 # 한 번에 처리 가능한 트랙 수 (Spotify 제한)
 CHUNK_SIZE: int = 100
@@ -255,6 +256,8 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
             })
         url = data.get("next")
 
+    console.log("플레이리스트 " + str(len(result)) + "개 조회. user_id="
+                + str(user_id) + " 샘플=" + json.dumps(result[:3]))
     return 200, result
 
 
@@ -295,21 +298,21 @@ async def replace_playlist(env, playlist_id: str, uris: List[str]) -> bool:
     100개씩 청크로 나눠 POST 로 이어 붙인다.
     """
     first: List[str] = uris[:CHUNK_SIZE]
-    status, _ = await spotify_api(
+    status, data = await spotify_api(
         env, "PUT", "/playlists/" + playlist_id + "/tracks", json_body={"uris": first}
     )
     if status not in (200, 201):
-        console.log("전체 교체 PUT 실패 status=" + str(status))
+        console.log("전체 교체 PUT 실패 status=" + str(status) + " body=" + json.dumps(data))
         return False
 
     rest: List[str] = uris[CHUNK_SIZE:]
     for i in range(0, len(rest), CHUNK_SIZE):
         chunk: List[str] = rest[i:i + CHUNK_SIZE]
-        status, _ = await spotify_api(
+        status, data = await spotify_api(
             env, "POST", "/playlists/" + playlist_id + "/tracks", json_body={"uris": chunk}
         )
         if status not in (200, 201):
-            console.log("전체 교체 POST 실패 status=" + str(status))
+            console.log("전체 교체 POST 실패 status=" + str(status) + " body=" + json.dumps(data))
             return False
     return True
 
@@ -318,11 +321,11 @@ async def add_tracks(env, playlist_id: str, uris: List[str]) -> bool:
     """플레이리스트에 트랙을 100개씩 청크로 추가하는 함수 (증분 동기화 전용)."""
     for i in range(0, len(uris), CHUNK_SIZE):
         chunk: List[str] = uris[i:i + CHUNK_SIZE]
-        status, _ = await spotify_api(
+        status, data = await spotify_api(
             env, "POST", "/playlists/" + playlist_id + "/tracks", json_body={"uris": chunk}
         )
         if status not in (200, 201):
-            console.log("트랙 추가 실패 status=" + str(status))
+            console.log("트랙 추가 실패 status=" + str(status) + " body=" + json.dumps(data))
             return False
     return True
 
@@ -446,7 +449,10 @@ async def handle_callback(request, env) -> Response:
 
     access: str = data.get("access_token")
     refresh: Optional[str] = data.get("refresh_token")
+    granted_scope: str = data.get("scope") or ""
+    console.log("토큰 발급 완료. 부여된 scope=" + granted_scope)
     await env.SPOTIFY_KV.put(KV_ACCESS, access, to_js_obj({"expirationTtl": 3600}))
+    await env.SPOTIFY_KV.put(KV_SCOPE, granted_scope)
     if refresh:
         await env.SPOTIFY_KV.put(KV_REFRESH, refresh)
 
@@ -471,12 +477,15 @@ async def handle_status(env) -> Response:
     playlist_id: Optional[str] = await env.SPOTIFY_KV.get(KV_PLAYLIST)
     playlist_url: str = ("https://open.spotify.com/playlist/" + playlist_id) if playlist_id else ""
 
+    scope: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
+
     payload: Dict[str, Any] = {
         "synced": synced,
         "last_sync": last_sync,
         "track_count": track_count,
         "playlist_url": playlist_url,
         "playlist_id": playlist_id or "",
+        "scope": scope,
     }
     return json_response(payload)
 
