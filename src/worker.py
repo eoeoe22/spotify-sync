@@ -195,9 +195,13 @@ async def fetch_liked_songs(env) -> List[str]:
 
 
 async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
-    """대상 플레이리스트에 이미 들어 있는 track URI 집합을 모으는 함수."""
+    """대상 플레이리스트에 이미 들어 있는 트랙 URI 집합을 모으는 함수.
+
+    2026 API 마이그레이션으로 /tracks -> /items, 각 항목의 track -> item 으로 바뀌어
+    item.item 을 우선 보고 옛 응답(track)도 폴백으로 지원한다.
+    """
     existing: Set[str] = set()
-    url: Optional[str] = "/playlists/" + playlist_id + "/tracks?limit=100"
+    url: Optional[str] = "/playlists/" + playlist_id + "/items?limit=100"
 
     while url:
         status, data = await spotify_api(env, "GET", url)
@@ -205,9 +209,9 @@ async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
             console.log("플레이리스트 트랙 조회 실패 status=" + str(status))
             break
         for item in data.get("items", []):
-            track: Optional[Dict[str, Any]] = item.get("track")
-            if track and track.get("uri"):
-                existing.add(track["uri"])
+            entry: Optional[Dict[str, Any]] = item.get("item") or item.get("track")
+            if entry and entry.get("uri"):
+                existing.add(entry["uri"])
         url = data.get("next")
 
     return existing
@@ -252,7 +256,7 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
                 "name": pl.get("name"),
                 "owner": owner_id,
                 "editable": editable,
-                "tracks": (pl.get("tracks") or {}).get("total", 0),
+                "tracks": (pl.get("items") or pl.get("tracks") or {}).get("total", 0),
             })
         url = data.get("next")
 
@@ -299,7 +303,7 @@ async def replace_playlist(env, playlist_id: str, uris: List[str]) -> bool:
     """
     first: List[str] = uris[:CHUNK_SIZE]
     status, data = await spotify_api(
-        env, "PUT", "/playlists/" + playlist_id + "/tracks", json_body={"uris": first}
+        env, "PUT", "/playlists/" + playlist_id + "/items", json_body={"uris": first}
     )
     if status not in (200, 201):
         console.log("전체 교체 PUT 실패 status=" + str(status) + " body=" + json.dumps(data))
@@ -309,7 +313,7 @@ async def replace_playlist(env, playlist_id: str, uris: List[str]) -> bool:
     for i in range(0, len(rest), CHUNK_SIZE):
         chunk: List[str] = rest[i:i + CHUNK_SIZE]
         status, data = await spotify_api(
-            env, "POST", "/playlists/" + playlist_id + "/tracks", json_body={"uris": chunk}
+            env, "POST", "/playlists/" + playlist_id + "/items", json_body={"uris": chunk}
         )
         if status not in (200, 201):
             console.log("전체 교체 POST 실패 status=" + str(status) + " body=" + json.dumps(data))
@@ -322,7 +326,7 @@ async def add_tracks(env, playlist_id: str, uris: List[str]) -> bool:
     for i in range(0, len(uris), CHUNK_SIZE):
         chunk: List[str] = uris[i:i + CHUNK_SIZE]
         status, data = await spotify_api(
-            env, "POST", "/playlists/" + playlist_id + "/tracks", json_body={"uris": chunk}
+            env, "POST", "/playlists/" + playlist_id + "/items", json_body={"uris": chunk}
         )
         if status not in (200, 201):
             console.log("트랙 추가 실패 status=" + str(status) + " body=" + json.dumps(data))
