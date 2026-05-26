@@ -1,6 +1,6 @@
 name = "spotify-sync"
 main = "src/worker.py"
-compatibility_date = "2025-05-26"
+compatibility_date = "2025-09-01"
 compatibility_flags = ["python_workers"]
 
 # 매일 00:00 UTC 자동 동기화
