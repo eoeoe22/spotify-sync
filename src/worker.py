@@ -26,7 +26,13 @@ from workers import WorkerEntrypoint, Response
 SPOTIFY_AUTH_URL: str = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL: str = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
-SCOPE: str = "user-library-read playlist-modify-public playlist-modify-private"
+SCOPE: str = (
+    "user-library-read "
+    "playlist-read-private "
+    "playlist-read-collaborative "
+    "playlist-modify-public "
+    "playlist-modify-private"
+)
 
 # KV 키
 KV_ACCESS: str = "spotify:access_token"
@@ -224,8 +230,12 @@ async def get_user_id(env) -> Optional[str]:
     return None
 
 
-async def list_playlists(env) -> List[Dict[str, Any]]:
-    """현재 사용자의 플레이리스트 목록을 모아 dict 리스트로 반환하는 함수."""
+async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
+    """현재 사용자의 플레이리스트 목록을 (상태코드, dict 리스트)로 반환하는 함수.
+
+    Spotify 조회가 실패하면 그 상태코드를 함께 돌려주어, 호출 측이 '목록 없음'과
+    '조회 실패(스코프 부족 등)'를 구분할 수 있게 한다.
+    """
     user_id: Optional[str] = await get_user_id(env)
     result: List[Dict[str, Any]] = []
     url: Optional[str] = "/me/playlists?limit=50"
@@ -234,7 +244,7 @@ async def list_playlists(env) -> List[Dict[str, Any]]:
         status, data = await spotify_api(env, "GET", url)
         if status != 200:
             console.log("플레이리스트 목록 조회 실패 status=" + str(status))
-            break
+            return status, result
         for pl in data.get("items", []):
             owner_id: Optional[str] = (pl.get("owner") or {}).get("id")
             editable: bool = (owner_id == user_id) or bool(pl.get("collaborative"))
@@ -247,7 +257,7 @@ async def list_playlists(env) -> List[Dict[str, Any]]:
             })
         url = data.get("next")
 
-    return result
+    return 200, result
 
 
 async def create_playlist(env, name: str) -> Optional[str]:
@@ -479,7 +489,7 @@ async def handle_fetch(request, env) -> Response:
     if path == "/status":
         return await handle_status(env)
     if path == "/favicon.ico":
-        return Response("", status=204)
+        return Response(None, status=204)
 
     # Cloudflare Access JWT 헤더 검증 (헤더 존재 여부만 확인)
     jwt: Optional[str] = request.headers.get("CF-Access-Jwt-Assertion")
@@ -493,7 +503,13 @@ async def handle_fetch(request, env) -> Response:
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html; charset=utf-8"})
 
     if path == "/playlists" and method == "GET":
-        return json_response({"playlists": await list_playlists(env)})
+        status, playlists = await list_playlists(env)
+        if status != 200:
+            detail = "Spotify 플레이리스트 조회 실패 (status " + str(status) + ")."
+            if status == 403:
+                detail += " 스코프가 부족합니다. /login 으로 다시 인증하세요."
+            return json_response({"playlists": [], "error": detail}, status=status)
+        return json_response({"playlists": playlists})
 
     if path == "/select" and method == "POST":
         body = await read_json(request)
@@ -611,13 +627,15 @@ DASHBOARD_HTML: str = """<!doctype html>
         hint.textContent = '목록 요청 중 오류: ' + e;
         return;
       }
+      let data = {};
+      try { data = await res.json(); } catch (e) { /* 본문 없음 */ }
       if (!res.ok) {
         sel.innerHTML = '';
-        hint.textContent = '목록을 불러오지 못했습니다 (HTTP ' + res.status
-          + '). Spotify 연동 상태와 Cloudflare Access 설정을 확인하세요.';
+        hint.textContent = data.error
+          || ('목록을 불러오지 못했습니다 (HTTP ' + res.status
+              + '). Spotify 연동 상태와 Cloudflare Access 설정을 확인하세요.');
         return;
       }
-      const data = await res.json();
       const lists = data.playlists || [];
       sel.innerHTML = '';
       if (lists.length === 0) {

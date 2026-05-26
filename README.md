@@ -87,8 +87,8 @@ spotify-sync/
 
 1. 브라우저에서 `https://spotify.vialinks.xyz/login` 에 접속합니다.
    - (`/login`, `/callback` 은 Access 보호 대상이 아니므로 바로 접근됩니다.)
-2. Spotify 인증 화면에서 권한(`user-library-read`, `playlist-modify-public`,
-   `playlist-modify-private`)을 허용합니다.
+2. Spotify 인증 화면에서 권한(`user-library-read`, `playlist-read-private`,
+   `playlist-read-collaborative`, `playlist-modify-public`, `playlist-modify-private`)을 허용합니다.
 3. 콜백이 처리되며 `access_token`·`refresh_token`·`user_id` 가 KV 에 저장되고
    대시보드(`/`)로 리다이렉트됩니다.
 4. 대시보드에서 **미러 플레이리스트**를 지정합니다.
