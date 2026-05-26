@@ -206,9 +206,27 @@ async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
     return existing
 
 
+async def get_user_id(env) -> Optional[str]:
+    """Spotify user_id 를 반환하는 함수.
+
+    KV 에 있으면 그대로 쓰고, 없으면 /me 로 조회해 KV 에 저장한 뒤 반환한다.
+    (콜백 때 저장에 실패했더라도 플레이리스트 조회/생성이 동작하도록 자가 복구.)
+    """
+    user_id: Optional[str] = await env.SPOTIFY_KV.get(KV_USER)
+    if user_id:
+        return user_id
+    status, data = await spotify_api(env, "GET", "/me")
+    if status == 200 and data.get("id"):
+        user_id = data["id"]
+        await env.SPOTIFY_KV.put(KV_USER, user_id)
+        return user_id
+    console.log("사용자 정보 조회 실패 status=" + str(status))
+    return None
+
+
 async def list_playlists(env) -> List[Dict[str, Any]]:
     """현재 사용자의 플레이리스트 목록을 모아 dict 리스트로 반환하는 함수."""
-    user_id: Optional[str] = await env.SPOTIFY_KV.get(KV_USER)
+    user_id: Optional[str] = await get_user_id(env)
     result: List[Dict[str, Any]] = []
     url: Optional[str] = "/me/playlists?limit=50"
 
@@ -234,8 +252,9 @@ async def list_playlists(env) -> List[Dict[str, Any]]:
 
 async def create_playlist(env, name: str) -> Optional[str]:
     """새 공개 플레이리스트를 만들고 그 id 를 반환하는 함수."""
-    user_id: Optional[str] = await env.SPOTIFY_KV.get(KV_USER)
+    user_id: Optional[str] = await get_user_id(env)
     if not user_id:
+        console.log("user_id 를 확인할 수 없어 플레이리스트를 생성할 수 없습니다.")
         return None
     body: Dict[str, Any] = {
         "name": name,
@@ -543,6 +562,7 @@ DASHBOARD_HTML: str = """<!doctype html>
           <button class="btn btn-outline-primary" onclick="savePlaylist()">선택 저장</button>
           <button class="btn btn-outline-success" onclick="createPlaylist()">새 플레이리스트 생성</button>
         </div>
+        <small id="playlistHint" class="text-muted d-block mt-2"></small>
       </div>
     </div>
 
@@ -581,41 +601,63 @@ DASHBOARD_HTML: str = """<!doctype html>
     }
 
     async function loadPlaylists(current) {
-      const res = await fetch('/playlists');
-      if (!res.ok) { return; }
-      const data = await res.json();
       const sel = document.getElementById('playlistSelect');
+      const hint = document.getElementById('playlistHint');
+      hint.textContent = '';
+      let res;
+      try {
+        res = await fetch('/playlists');
+      } catch (e) {
+        hint.textContent = '목록 요청 중 오류: ' + e;
+        return;
+      }
+      if (!res.ok) {
+        sel.innerHTML = '';
+        hint.textContent = '목록을 불러오지 못했습니다 (HTTP ' + res.status
+          + '). Spotify 연동 상태와 Cloudflare Access 설정을 확인하세요.';
+        return;
+      }
+      const data = await res.json();
+      const lists = data.playlists || [];
       sel.innerHTML = '';
-      (data.playlists || []).forEach(function (p) {
+      if (lists.length === 0) {
+        hint.textContent = '플레이리스트가 없습니다. "새 플레이리스트 생성"으로 만들어 주세요.';
+        return;
+      }
+      lists.forEach(function (p) {
         const opt = document.createElement('option');
         opt.value = p.id;
         opt.textContent = p.name + ' (' + p.tracks + '곡)' + (p.editable ? '' : ' [편집불가]');
+        if (!p.editable) { opt.disabled = true; }
         if (p.id === current) { opt.selected = true; }
         sel.appendChild(opt);
       });
     }
 
+    async function postJson(url, payload) {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      let body = {};
+      try { body = await res.json(); } catch (e) { /* 본문 없음 */ }
+      return { ok: res.ok, status: res.status, body: body };
+    }
+
     async function savePlaylist() {
       const pid = document.getElementById('playlistSelect').value;
       if (!pid) { return; }
-      const res = await fetch('/select', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ playlist_id: pid })
-      });
-      alert(res.ok ? '저장되었습니다.' : '저장에 실패했습니다.');
+      const r = await postJson('/select', { playlist_id: pid });
+      alert(r.ok ? '저장되었습니다.' : ('저장 실패: ' + (r.body.error || ('HTTP ' + r.status))));
       loadStatus();
     }
 
     async function createPlaylist() {
       const name = prompt('새 플레이리스트 이름을 입력하세요.', '좋아요 미러');
       if (!name) { return; }
-      const res = await fetch('/create', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: name })
-      });
-      alert(res.ok ? '생성되었습니다.' : '생성에 실패했습니다.');
+      const r = await postJson('/create', { name: name });
+      alert(r.ok ? '생성되었습니다.' : ('생성 실패: ' + (r.body.error || ('HTTP ' + r.status))));
       loadStatus();
     }
 
