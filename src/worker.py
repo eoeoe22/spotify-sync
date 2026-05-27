@@ -512,13 +512,20 @@ async def handle_fetch(request, env) -> Response:
     if path == "/favicon.ico":
         return Response(None, status=204)
 
+    # IP 화이트리스트 확인 — 허용된 IP 이면 JWT 인증 건너뜀
+    client_ip: str = request.headers.get("CF-Connecting-IP") or ""
+    raw_whitelist: str = getattr(env, "IP_WHITELIST", "") or ""
+    allowed_ips = {ip.strip() for ip in raw_whitelist.split(",") if ip.strip()}
+    ip_whitelisted: bool = bool(client_ip and client_ip in allowed_ips)
+
     # Cloudflare Access JWT 헤더 검증 (헤더 존재 여부만 확인)
-    jwt: Optional[str] = request.headers.get("CF-Access-Jwt-Assertion")
-    if not jwt:
-        return Response(
-            "403 Forbidden: Cloudflare Access 인증이 필요한 경로입니다.",
-            status=403,
-        )
+    if not ip_whitelisted:
+        jwt: Optional[str] = request.headers.get("CF-Access-Jwt-Assertion")
+        if not jwt:
+            return Response(
+                "403 Forbidden: Cloudflare Access 인증이 필요한 경로입니다.",
+                status=403,
+            )
 
     if path == "/" and method == "GET":
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html; charset=utf-8"})

@@ -20,6 +20,9 @@ id = "226fd06df76548a2aa8477fba7c06691"
 # 환경변수 (공개 가능 값만). SPOTIFY_CLIENT_SECRET 은 secret 으로 별도 주입.
 [vars]
 SPOTIFY_CLIENT_ID = "d87978f9aec64e5d9f45a7dc06ce98ca"
+# 쉼표로 구분된 IP 화이트리스트. 해당 IP 에서 오는 요청은 Cloudflare Access JWT 인증을 건너뜁니다.
+# 예: IP_WHITELIST = "1.2.3.4,10.0.0.1"
+IP_WHITELIST = ""
 
 # 관측 가능성 (로그 전체 수집)
 [observability]
