@@ -45,13 +45,12 @@ spotify-sync/
 2. **Create app** 클릭 후 아래와 같이 입력합니다.
    - **App name**: `spotify-sync` (자유롭게)
    - **App description**: `좋아요 표시한 곡을 공개 플레이리스트로 매일 동기화` (자유롭게)
-   - **Redirect URIs**: 아래 두 개를 모두 등록하는 것을 권장합니다.
-     - `https://spotify.vialinks.xyz/callback` (커스텀 도메인)
+   - **Redirect URIs**: 두 방식중 한가지를 선택해 등록합니다.
+     - `https://spotify.vialinks.xyz/callback` (커스텀 도메인 사용 시)
      - `https://spotify-sync.<계정명>.workers.dev/callback` (workers.dev 기본 도메인)
    - **Which API/SDKs are you planning to use?**: `Web API` 체크
 3. 저장 후 앱 **Settings** 에서 **Client ID** 와 **Client secret** 을 확인합니다.
-   - Client ID 는 이미 `wrangler.toml` 의 `SPOTIFY_CLIENT_ID` 에 들어 있습니다
-     (`d87978f9aec64e5d9f45a7dc06ce98ca`). 다른 앱을 쓴다면 이 값을 교체하세요.
+   - Client ID 는 이미 `wrangler.toml` 의 `SPOTIFY_CLIENT_ID` 에 붙여넣습니다.
    - Client secret 은 비밀값이므로 Cloudflare secret 으로 주입합니다(아래 2번 참고).
 
 > Redirect URI 는 등록한 값과 **정확히** 일치해야 합니다. 이 앱은 `/login` 에 접속한
@@ -61,7 +60,7 @@ spotify-sync/
 
 ## 2. Cloudflare 배포 (GitHub 연동)
 
-1. 이 코드를 GitHub 레포지토리(`spotify-sync`)에 push 합니다.
+1. 이 코드를 새 GitHub 레포지토리(`spotify-sync`)에 push 합니다.
 2. Cloudflare 대시보드 → **Workers & Pages** → **Create application** → **Workers** 탭
    → **Continue with GitHub** 를 선택합니다.
 3. 방금 만든 `spotify-sync` 레포지토리와 배포 브랜치를 선택합니다.
@@ -70,16 +69,9 @@ spotify-sync/
 4. 배포가 끝나면 애플리케이션 **Settings → 변수 및 암호(Variables and Secrets)** 로 이동합니다.
 5. **암호(Secret)** 로 `SPOTIFY_CLIENT_SECRET` 을 추가하고 Spotify 의 Client secret 값을 입력한 뒤 저장합니다.
    - `SPOTIFY_CLIENT_ID` 는 `wrangler.toml` 의 `[vars]` 에 평문으로 들어 있어 별도 입력이 필요 없습니다.
-6. **KV 네임스페이스** `SPOTIFY_KV` (id `226fd06df76548a2aa8477fba7c06691`) 와
-   **커스텀 도메인** `spotify.vialinks.xyz` 도 `wrangler.toml` 로 자동 구성됩니다.
+6. **KV 네임스페이스** Cloudflare 대시보드 → 스토리지 및 데이터베이스 → Workers KV 경로로 접속해 새 KV 스토리지를 생성하고, `wrangler.toml`의 KV 바인딩 부분의 id 및 이름을 교체하세요.
+   **커스텀 도메인** 도 `wrangler.toml` 로 자동 구성됩니다.
    대시보드 **Settings → Domains & Routes** 에서 연결 상태를 확인하세요.
-
-> 로컬에서 배포하려면 [`pywrangler`](https://github.com/cloudflare/workers-py) 를 사용합니다.
-> ```bash
-> npx wrangler kv key list --binding SPOTIFY_KV   # KV 확인 (옵션)
-> npx pywrangler deploy
-> npx wrangler secret put SPOTIFY_CLIENT_SECRET    # secret 주입
-> ```
 
 ---
 
@@ -87,8 +79,7 @@ spotify-sync/
 
 1. 브라우저에서 `https://spotify.vialinks.xyz/login` 에 접속합니다.
    - (`/login`, `/callback` 은 Access 보호 대상이 아니므로 바로 접근됩니다.)
-2. Spotify 인증 화면에서 권한(`user-library-read`, `playlist-read-private`,
-   `playlist-read-collaborative`, `playlist-modify-public`, `playlist-modify-private`)을 허용합니다.
+2. Spotify 인증 화면에서 권한을 허용합니다.
 3. 콜백이 처리되며 `access_token`·`refresh_token`·`user_id` 가 KV 에 저장되고
    대시보드(`/`)로 리다이렉트됩니다.
 4. 대시보드에서 **미러 플레이리스트**를 지정합니다.
@@ -109,9 +100,9 @@ spotify-sync/
 2. **Application Configuration**
    - **Application name**: `spotify-sync`
    - **Session Duration**: 원하는 값 (예: 24h)
-   - **Public hostname**: `spotify.vialinks.xyz` (Path 는 비워 전체 경로 보호)
+   - **Public hostname**: 앞서 입력한 도메인 (Path 는 비워 전체 경로 보호)
 3. **Policies** 에서 본인만 허용하는 정책을 추가합니다.
-   - 예: **Action** `Allow`, **Include** → `Emails` → 본인 이메일(`eoe253326@gmail.com`).
+   - 예: **Action** `Allow`, **Include** → `Emails` → 본인 이메일.
 4. 저장하면 보호된 경로 접속 시 Access 로그인 후, Cloudflare 가
    `CF-Access-Jwt-Assertion` 헤더를 Worker 로 주입합니다. Worker 는 이 헤더의 존재 여부를 확인합니다.
 
