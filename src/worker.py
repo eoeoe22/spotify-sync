@@ -69,7 +69,12 @@ KV_PLAYLIST: str = "spotify:playlist_id"
 KV_LAST_TIME: str = "spotify:last_sync_time"
 KV_LAST_COUNT: str = "spotify:last_sync_count"
 KV_SCOPE: str = "spotify:scope"
-KV_OAUTH_STATE_PREFIX: str = "spotify:oauth_state:"
+
+# OAuth state CSRF 토큰은 HttpOnly 쿠키로 보존한다.
+# Cloudflare Workers KV 는 cross-edge 전파에 최대 60초 이상 걸릴 수 있어
+# 짧은 수명의 nonce 에는 적합하지 않다.
+#   https://developers.cloudflare.com/kv/concepts/how-kv-works/#consistency
+OAUTH_STATE_COOKIE: str = "spotify_oauth_state"
 
 
 # --- 유틸 ------------------------------------------------------------------
@@ -100,6 +105,16 @@ async def read_json(request) -> Dict[str, Any]:
     except (ValueError, TypeError) as exc:
         console.log("요청 본문 파싱 실패: " + str(exc))
         return {}
+
+
+def read_cookie(request, name: str) -> Optional[str]:
+    """요청의 Cookie 헤더에서 name 의 값을 꺼낸다 (없으면 None)."""
+    raw = request.headers.get("Cookie") or request.headers.get("cookie") or ""
+    for part in raw.split(";"):
+        kv = part.strip().split("=", 1)
+        if len(kv) == 2 and kv[0] == name:
+            return kv[1]
+    return None
 
 
 # --- 저수준 HTTP -----------------------------------------------------------
@@ -464,13 +479,10 @@ async def handle_login(request, env) -> Response:
     """Spotify Authorization Code Flow 시작.
 
     공식 문서: response_type=code, scope, redirect_uri, state (CSRF), show_dialog 옵션.
-    state 는 KV 에 10분 TTL 로 저장해 콜백에서 검증한다.
+    state 는 HttpOnly·Secure·SameSite=Lax 쿠키로 보존해 콜백에서 검증한다.
+    (KV 는 eventually consistent 라 cross-edge 콜백에서 못 읽을 수 있음.)
     """
     state = secrets.token_urlsafe(24)
-    await env.SPOTIFY_KV.put(
-        KV_OAUTH_STATE_PREFIX + state, "1",
-        to_js_obj({"expirationTtl": 600}),
-    )
     params = {
         "client_id": str(env.SPOTIFY_CLIENT_ID),
         "response_type": "code",
@@ -479,7 +491,18 @@ async def handle_login(request, env) -> Response:
         "state": state,
         "show_dialog": "true",
     }
-    return Response.redirect(SPOTIFY_AUTH_URL + "?" + urlencode(params), 302)
+    cookie = (
+        OAUTH_STATE_COOKIE + "=" + state
+        + "; Path=/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
+    )
+    return Response(
+        None,
+        status=302,
+        headers={
+            "Location": SPOTIFY_AUTH_URL + "?" + urlencode(params),
+            "Set-Cookie": cookie,
+        },
+    )
 
 
 async def handle_callback(request, env) -> Response:
@@ -496,11 +519,10 @@ async def handle_callback(request, env) -> Response:
     if not state:
         return Response("state 파라미터가 없습니다.", status=400)
 
-    # CSRF 방어: 저장한 state 와 일치하는지 확인 후 일회용으로 삭제
-    saved = await env.SPOTIFY_KV.get(KV_OAUTH_STATE_PREFIX + state)
-    if not saved:
+    # CSRF 방어: 쿠키의 state 와 URL state 가 일치해야 한다.
+    cookie_state = read_cookie(request, OAUTH_STATE_COOKIE)
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
         return Response("state 가 유효하지 않거나 만료되었습니다.", status=400)
-    await env.SPOTIFY_KV.delete(KV_OAUTH_STATE_PREFIX + state)
 
     redirect_uri = origin_of(request) + "/callback"
     status, data = await exchange_code(env, code, redirect_uri)
@@ -527,7 +549,18 @@ async def handle_callback(request, env) -> Response:
         await env.SPOTIFY_KV.put(KV_USER, me["id"])
 
     console.log("OAuth 연동 완료, scope=" + str(data.get("scope") or ""))
-    return Response.redirect(origin_of(request) + "/", 302)
+    # 쿠키 state 는 일회용 — 응답에서 즉시 만료시킨다.
+    clear_cookie = (
+        OAUTH_STATE_COOKIE + "=; Path=/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+    )
+    return Response(
+        None,
+        status=302,
+        headers={
+            "Location": origin_of(request) + "/",
+            "Set-Cookie": clear_cookie,
+        },
+    )
 
 
 async def handle_status(env) -> Response:
