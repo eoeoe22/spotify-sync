@@ -33,6 +33,7 @@ SCOPE: str = (
     "playlist-modify-public "
     "playlist-modify-private"
 )
+REQUIRED_SCOPES: Set[str] = set(SCOPE.split())
 
 # KV 키
 KV_ACCESS: str = "spotify:access_token"
@@ -250,21 +251,30 @@ async def get_user_id(env) -> Optional[str]:
     return await env.SPOTIFY_KV.get(KV_USER)
 
 
-async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
-    """현재 사용자의 플레이리스트 목록을 (상태코드, dict 리스트)로 반환하는 함수.
+async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str]:
+    """현재 사용자의 플레이리스트 목록을 (상태코드, dict 리스트, Spotify 오류 메시지)로 반환하는 함수.
 
-    Spotify 조회가 실패하면 그 상태코드를 함께 돌려주어, 호출 측이 '목록 없음'과
-    '조회 실패(스코프 부족 등)'를 구분할 수 있게 한다.
+    Spotify 조회가 실패하면 그 상태코드와 본문의 error.message 를 함께 돌려주어,
+    호출 측이 '목록 없음'/'스코프 부족'/'Development Mode 차단' 등을 구분해 표시할 수 있게 한다.
     """
     user_id: Optional[str] = await get_user_id(env)
     result: List[Dict[str, Any]] = []
     url: Optional[str] = "/me/playlists?limit=50"
+    spotify_err: str = ""
 
     while url:
         status, data = await spotify_api(env, "GET", url)
         if status != 200:
-            console.log("플레이리스트 목록 조회 실패 status=" + str(status))
-            return status, result
+            console.log(
+                "플레이리스트 목록 조회 실패 status=" + str(status)
+                + " body=" + json.dumps(data)
+            )
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict) and err.get("message"):
+                spotify_err = str(err["message"])
+            elif isinstance(err, str):
+                spotify_err = err
+            return status, result, spotify_err
         for pl in data.get("items", []):
             owner_id: Optional[str] = (pl.get("owner") or {}).get("id")
             editable: bool = (owner_id == user_id) or bool(pl.get("collaborative"))
@@ -279,7 +289,7 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]]]:
 
     console.log("플레이리스트 " + str(len(result)) + "개 조회. user_id="
                 + str(user_id) + " 샘플=" + json.dumps(result[:3]))
-    return 200, result
+    return 200, result, ""
 
 
 async def create_playlist(env, name: str) -> Tuple[Optional[str], int, str]:
@@ -551,12 +561,32 @@ async def handle_fetch(request, env) -> Response:
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html; charset=utf-8"})
 
     if path == "/playlists" and method == "GET":
-        status, playlists = await list_playlists(env)
+        status, playlists, spotify_err = await list_playlists(env)
         if status != 200:
-            detail = "Spotify 플레이리스트 조회 실패 (status " + str(status) + ")."
-            if status == 403:
-                detail += " 스코프가 부족합니다. /login 으로 다시 인증하세요."
-            return json_response({"playlists": [], "error": detail}, status=status)
+            granted: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
+            granted_set: Set[str] = set(granted.split()) if granted else set()
+            missing: List[str] = sorted(REQUIRED_SCOPES - granted_set)
+            detail = "Spotify 플레이리스트 조회 실패 (status " + str(status) + ")"
+            if spotify_err:
+                detail += ": " + spotify_err
+            detail += "."
+            if missing:
+                detail += (
+                    " 부여되지 않은 scope: " + ", ".join(missing)
+                    + ". /login 으로 다시 인증해 모든 권한을 허용하세요."
+                )
+            elif status == 403:
+                detail += (
+                    " 모든 scope 가 부여돼 있는데도 403 이면, Spotify 앱이 Development Mode 일 가능성이 큽니다."
+                    " Spotify Developer Dashboard 의 해당 앱 → User Management 에 본인 계정(이메일)을 추가하세요."
+                )
+            return json_response({
+                "playlists": [],
+                "error": detail,
+                "granted_scope": granted,
+                "missing_scope": missing,
+                "spotify_error": spotify_err,
+            }, status=status)
         return json_response({"playlists": playlists})
 
     if path == "/select" and method == "POST":
