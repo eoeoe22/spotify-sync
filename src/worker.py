@@ -1,19 +1,32 @@
-"""Spotify '좋아요 표시한 곡'을 공개 플레이리스트로 동기화하는 Cloudflare Worker.
+"""Spotify 좋아요 곡을 공개 플레이리스트로 동기화하는 Cloudflare Worker (Python).
+
+Spotify Web API 공식 문서를 기준으로 처음부터 다시 작성한 구현이다.
+2026년 2월/3월 마이그레이션 이후의 엔드포인트와 응답 스키마를 따른다.
 
 라우팅:
-  GET  /          → 대시보드 HTML (Cloudflare Access 보호)
+  GET  /          → 대시보드 (Cloudflare Access 보호)
   GET  /login     → Spotify OAuth 시작 (공개)
-  GET  /callback  → OAuth 콜백 처리 (공개)
+  GET  /callback  → OAuth 콜백 (공개)
   GET  /status    → 동기화 상태 JSON (공개)
-  GET  /playlists → 사용자 플레이리스트 목록 JSON (Access 보호)
+  GET  /playlists → 사용자 플레이리스트 목록 (Access 보호)
   POST /select    → 미러 플레이리스트 선택 (Access 보호)
   POST /create    → 새 미러 플레이리스트 생성 (Access 보호)
   POST /sync      → 수동 동기화 (Access 보호)
-  scheduled       → 매일 cron 자동 동기화
+  scheduled cron  → 매일 자동 동기화
+
+참고:
+  - Authorization Code Flow:  https://developer.spotify.com/documentation/web-api/tutorials/code-flow
+  - 2026-02 마이그레이션 가이드: https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide
+  - 플레이리스트 트랙 엔드포인트는 `/items` 로 변경되었고, 응답에서도
+    items[].item 으로 키가 바뀌었다.
+  - 플레이리스트 생성은 `POST /me/playlists` 만 지원된다.
+    (`POST /users/{user_id}/playlists` 는 제거됨.)
 """
 
 import json
+import secrets
 from datetime import datetime, timezone
+from base64 import b64encode
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, parse_qs, urlencode
 
@@ -21,19 +34,32 @@ from js import console, fetch, Object
 from pyodide.ffi import to_js as _to_js
 from workers import WorkerEntrypoint, Response
 
-# --- 상수 정의 -------------------------------------------------------------
+
+# --- 상수 ------------------------------------------------------------------
 
 SPOTIFY_AUTH_URL: str = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL: str = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
-SCOPE: str = (
-    "user-library-read "
-    "playlist-read-private "
-    "playlist-read-collaborative "
-    "playlist-modify-public "
-    "playlist-modify-private"
-)
-REQUIRED_SCOPES: Set[str] = set(SCOPE.split())
+
+# 필요한 권한 (공식 문서 기준):
+#   user-library-read            → GET /me/tracks (좋아요 곡 읽기)
+#   playlist-read-private        → 비공개 플레이리스트 목록 조회
+#   playlist-read-collaborative  → 협업 플레이리스트 목록 조회
+#   playlist-modify-public       → 공개 플레이리스트 생성/수정
+#   playlist-modify-private      → 비공개/협업 플레이리스트 수정
+# 미러로 비공개·협업 플레이리스트를 선택해도 동작하도록 modify-private 도 요청한다.
+SCOPES: List[str] = [
+    "user-library-read",
+    "playlist-read-private",
+    "playlist-read-collaborative",
+    "playlist-modify-public",
+    "playlist-modify-private",
+]
+SCOPE_STR: str = " ".join(SCOPES)
+REQUIRED_SCOPES: Set[str] = set(SCOPES)
+
+# 한 번의 PUT/POST 에 보낼 수 있는 최대 트랙 수 (공식 문서: 100)
+CHUNK_SIZE: int = 100
 
 # KV 키
 KV_ACCESS: str = "spotify:access_token"
@@ -44,413 +70,27 @@ KV_LAST_TIME: str = "spotify:last_sync_time"
 KV_LAST_COUNT: str = "spotify:last_sync_count"
 KV_SCOPE: str = "spotify:scope"
 
-# 한 번에 처리 가능한 트랙 수 (Spotify 제한)
-CHUNK_SIZE: int = 100
+# OAuth state CSRF 토큰은 HttpOnly 쿠키로 보존한다.
+# Cloudflare Workers KV 는 cross-edge 전파에 최대 60초 이상 걸릴 수 있어
+# 짧은 수명의 nonce 에는 적합하지 않다.
+#   https://developers.cloudflare.com/kv/concepts/how-kv-works/#consistency
+OAUTH_STATE_COOKIE: str = "spotify_oauth_state"
 
 
-def to_js_obj(obj: Dict[str, Any]):
-    """파이썬 dict 를 JS 일반 객체(Object)로 변환하는 함수.
+# --- 유틸 ------------------------------------------------------------------
 
-    pyodide 의 기본 변환은 dict 를 JS Map 으로 바꾸므로, fetch 옵션이나
-    KV put 옵션처럼 일반 객체가 필요한 곳에서는 이 함수로 변환한다.
-    """
+def to_js_obj(obj: Any) -> Any:
+    """파이썬 dict 를 fetch/KV 옵션에 쓸 JS Object 로 변환."""
     return _to_js(obj, dict_converter=Object.fromEntries)
 
 
-# --- 저수준 HTTP 헬퍼 ------------------------------------------------------
+def origin_of(request) -> str:
+    """요청 URL 에서 'scheme://host' 만 잘라낸다."""
+    p = urlparse(request.url)
+    return p.scheme + "://" + p.netloc
 
-async def http_request(
-    method: str,
-    url: str,
-    token: Optional[str] = None,
-    json_body: Optional[Dict[str, Any]] = None,
-    form_body: Optional[Dict[str, str]] = None,
-) -> Tuple[int, Dict[str, Any]]:
-    """HTTP 요청을 보내고 (상태코드, 응답 dict) 튜플을 돌려주는 함수.
 
-    json_body 가 있으면 application/json 으로, form_body 가 있으면
-    application/x-www-form-urlencoded 로 본문을 인코딩한다.
-    """
-    headers: Dict[str, str] = {}
-    if token:
-        headers["Authorization"] = "Bearer " + token
-
-    body: Optional[str] = None
-    if json_body is not None:
-        headers["Content-Type"] = "application/json"
-        body = json.dumps(json_body)
-    elif form_body is not None:
-        headers["Content-Type"] = "application/x-www-form-urlencoded"
-        body = urlencode(form_body)
-
-    options: Dict[str, Any] = {"method": method, "headers": headers}
-    if body is not None:
-        options["body"] = body
-
-    resp = await fetch(url, to_js_obj(options))
-    status: int = int(resp.status)
-    # pyodide 의 await resp.text() 는 JsProxy 래퍼를 돌려줄 수 있어 str() 로 명시 변환한다.
-    text: str = str(await resp.text() or "")
-    data: Dict[str, Any] = {}
-    if text.strip():
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                data = parsed
-            else:
-                data = {"_raw": parsed}
-        except (ValueError, TypeError) as exc:
-            # 비-JSON 응답(HTML 오류 페이지, 빈 본문 등)을 만나도 호출자가 status 로 처리할 수 있게
-            # 예외를 삼키고 원본 텍스트를 _raw 에 담아 반환한다.
-            console.log(
-                "응답 JSON 파싱 실패 status=" + str(status)
-                + " url=" + url + " err=" + str(exc)
-                + " body=" + text[:500]
-            )
-            data = {"_raw": text[:1000]}
-    return status, data
-
-
-# --- 토큰 관리 -------------------------------------------------------------
-
-async def refresh_token(env) -> Optional[str]:
-    """저장된 refresh_token 으로 새 access_token 을 발급받아 KV 에 저장하는 함수.
-
-    성공하면 새 access_token(str), 실패하면 None 을 반환한다.
-    """
-    rt: Optional[str] = await env.SPOTIFY_KV.get(KV_REFRESH)
-    if not rt:
-        console.log("refresh_token 이 없습니다. /login 으로 재인증이 필요합니다.")
-        return None
-
-    form: Dict[str, str] = {
-        "grant_type": "refresh_token",
-        "refresh_token": rt,
-        "client_id": str(env.SPOTIFY_CLIENT_ID),
-        "client_secret": str(env.SPOTIFY_CLIENT_SECRET),
-    }
-    status, data = await http_request("POST", SPOTIFY_TOKEN_URL, form_body=form)
-    if status != 200:
-        console.log("토큰 갱신 실패 status=" + str(status) + " body=" + json.dumps(data))
-        return None
-
-    access: str = data.get("access_token")
-    await env.SPOTIFY_KV.put(KV_ACCESS, access, to_js_obj({"expirationTtl": 3600}))
-
-    # Spotify 가 새 refresh_token 을 함께 줄 수도 있으므로 갱신한다.
-    new_rt: Optional[str] = data.get("refresh_token")
-    if new_rt:
-        await env.SPOTIFY_KV.put(KV_REFRESH, new_rt)
-
-    console.log("access_token 갱신 완료")
-    return access
-
-
-async def get_token(env) -> Optional[str]:
-    """유효한 access_token 을 반환하는 함수.
-
-    KV 에 access_token 이 살아 있으면 그대로 쓰고, TTL 만료로 사라졌으면
-    refresh_token() 을 호출해 자동 갱신한다. 둘 다 불가능하면 None.
-    """
-    access: Optional[str] = await env.SPOTIFY_KV.get(KV_ACCESS)
-    if access:
-        return access
-    return await refresh_token(env)
-
-
-async def spotify_api(
-    env,
-    method: str,
-    path: str,
-    json_body: Optional[Dict[str, Any]] = None,
-) -> Tuple[int, Dict[str, Any]]:
-    """access_token 을 붙여 Spotify API 를 호출하는 함수.
-
-    path 가 전체 URL(http로 시작)이면 그대로 쓰고, 아니면 API 베이스에 붙인다.
-    401 응답이 오면 토큰을 갱신한 뒤 한 번 재시도한다.
-    """
-    token: Optional[str] = await get_token(env)
-    if not token:
-        return 401, {}
-
-    url: str = path if path.startswith("http") else SPOTIFY_API_BASE + path
-    status, data = await http_request(method, url, token=token, json_body=json_body)
-
-    if status == 401:
-        token = await refresh_token(env)
-        if not token:
-            return 401, {}
-        status, data = await http_request(method, url, token=token, json_body=json_body)
-
-    return status, data
-
-
-# --- Spotify 데이터 수집 ---------------------------------------------------
-
-async def fetch_liked_songs(env) -> List[str]:
-    """좋아요 표시한 곡 전체의 track URI 리스트를 페이지네이션으로 모으는 함수.
-
-    GET /me/tracks 를 limit=50 으로 호출하고, 응답의 'next' 가 None 이 될 때까지
-    while 반복문으로 다음 페이지를 계속 가져온다.
-    """
-    uris: List[str] = []
-    url: Optional[str] = "/me/tracks?limit=50"
-
-    while url:
-        status, data = await spotify_api(env, "GET", url)
-        if status != 200:
-            console.log("좋아요 곡 조회 실패 status=" + str(status))
-            break
-        items: List[Dict[str, Any]] = data.get("items", [])
-        for item in items:
-            track: Optional[Dict[str, Any]] = item.get("track")
-            if track and track.get("uri"):
-                uris.append(track["uri"])
-        url = data.get("next")  # 다음 페이지 전체 URL 또는 None
-
-    console.log("좋아요 곡 " + str(len(uris)) + "개 수집 완료")
-    return uris
-
-
-async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
-    """대상 플레이리스트에 이미 들어 있는 트랙 URI 집합을 모으는 함수.
-
-    2026 API 마이그레이션으로 /tracks -> /items, 각 항목의 track -> item 으로 바뀌어
-    item.item 을 우선 보고 옛 응답(track)도 폴백으로 지원한다.
-    """
-    existing: Set[str] = set()
-    url: Optional[str] = "/playlists/" + playlist_id + "/items?limit=100"
-
-    while url:
-        status, data = await spotify_api(env, "GET", url)
-        if status != 200:
-            console.log("플레이리스트 트랙 조회 실패 status=" + str(status))
-            break
-        for item in data.get("items", []):
-            entry: Optional[Dict[str, Any]] = item.get("item") or item.get("track")
-            if entry and entry.get("uri"):
-                existing.add(entry["uri"])
-        url = data.get("next")
-
-    return existing
-
-
-async def get_user_id(env) -> Optional[str]:
-    """현재 토큰의 Spotify user_id 를 반환하는 함수.
-
-    항상 /me 로 현재 토큰 주인의 id 를 조회해 KV 에 최신화한다. (재인증으로 계정이
-    바뀌었을 때 KV 의 옛 user_id 를 그대로 쓰면 플레이리스트 생성이 403/404 로
-    실패하므로, 신선한 값을 사용한다.) /me 가 실패하면 KV 의 마지막 값으로 폴백한다.
-    """
-    status, data = await spotify_api(env, "GET", "/me")
-    if status == 200 and data.get("id"):
-        user_id: str = data["id"]
-        await env.SPOTIFY_KV.put(KV_USER, user_id)
-        return user_id
-    console.log("/me 조회 실패 status=" + str(status) + ", KV 값으로 폴백")
-    return await env.SPOTIFY_KV.get(KV_USER)
-
-
-async def list_playlists(env) -> Dict[str, Any]:
-    """현재 사용자의 플레이리스트 목록과 메타 정보를 dict 로 반환하는 함수.
-
-    반환 키:
-      status: 마지막 Spotify HTTP 상태
-      playlists: 수집한 플레이리스트 dict 의 리스트
-      spotify_error: 실패 시 error.message (없으면 "")
-      total: Spotify 가 보고한 총 플레이리스트 수
-      user_id: 현재 토큰의 Spotify user id
-      first_page_keys: 첫 페이지 응답의 최상위 키 목록 (구조 변경 진단용)
-      first_page_raw: 첫 페이지 응답 본문 (truncate). 항목이 비어 있을 때 사용자가
-        직접 확인하고 싶을 수 있어 응답에 실어둔다.
-    """
-    user_id: Optional[str] = await get_user_id(env)
-    result: List[Dict[str, Any]] = []
-    url: Optional[str] = "/me/playlists?limit=50"
-    spotify_err: str = ""
-    total: int = 0
-    first_page: bool = True
-    first_page_keys: List[str] = []
-    first_page_raw: str = ""
-
-    while url:
-        status, data = await spotify_api(env, "GET", url)
-        if first_page:
-            first_page = False
-            if isinstance(data, dict):
-                try:
-                    total = int(data.get("total") or 0)
-                except (ValueError, TypeError):
-                    total = 0
-                items_len: int = len(data.get("items", []) or [])
-                first_page_keys = list(data.keys())[:20]
-                first_page_raw = json.dumps(data)[:1500]
-                console.log(
-                    "/me/playlists 첫 페이지 status=" + str(status)
-                    + " user_id=" + str(user_id) + " total=" + str(total)
-                    + " items_in_page=" + str(items_len)
-                    + " keys=" + ",".join(first_page_keys)
-                )
-                if status == 200 and items_len == 0:
-                    console.log("응답 raw=" + first_page_raw)
-        if status != 200:
-            console.log(
-                "플레이리스트 목록 조회 실패 status=" + str(status)
-                + " body=" + json.dumps(data)
-            )
-            err = data.get("error") if isinstance(data, dict) else None
-            if isinstance(err, dict) and err.get("message"):
-                spotify_err = str(err["message"])
-            elif isinstance(err, str):
-                spotify_err = err
-            return {
-                "status": status, "playlists": result, "spotify_error": spotify_err,
-                "total": total, "user_id": user_id,
-                "first_page_keys": first_page_keys, "first_page_raw": first_page_raw,
-            }
-        for pl in data.get("items", []):
-            owner_id: Optional[str] = (pl.get("owner") or {}).get("id")
-            editable: bool = (owner_id == user_id) or bool(pl.get("collaborative"))
-            result.append({
-                "id": pl.get("id"),
-                "name": pl.get("name"),
-                "owner": owner_id,
-                "editable": editable,
-                "tracks": (pl.get("items") or pl.get("tracks") or {}).get("total", 0),
-            })
-        url = data.get("next")
-
-    console.log("플레이리스트 " + str(len(result)) + "개 조회. user_id="
-                + str(user_id) + " total=" + str(total)
-                + " 샘플=" + json.dumps(result[:3]))
-    return {
-        "status": 200, "playlists": result, "spotify_error": "",
-        "total": total, "user_id": user_id,
-        "first_page_keys": first_page_keys, "first_page_raw": first_page_raw,
-    }
-
-
-async def create_playlist(env, name: str) -> Tuple[Optional[str], int, str]:
-    """새 공개 플레이리스트를 만들고 (id, 상태코드, 오류메시지)를 반환하는 함수.
-
-    성공 시 (playlist_id, 201, ""), 실패 시 (None, status, 사람이 읽을 오류).
-    """
-    user_id: Optional[str] = await get_user_id(env)
-    if not user_id:
-        return None, 0, "사용자 정보를 확인할 수 없습니다. /login 으로 다시 인증하세요."
-
-    body: Dict[str, Any] = {
-        "name": name,
-        "public": True,
-        "description": "좋아요 표시한 곡 자동 미러 (spotify-sync)",
-    }
-    status, data = await spotify_api(env, "POST", "/users/" + user_id + "/playlists", json_body=body)
-    if status not in (200, 201):
-        console.log("플레이리스트 생성 실패 status=" + str(status) + " body=" + json.dumps(data))
-        msg: str = "Spotify 생성 실패 (status " + str(status) + ")"
-        err = data.get("error") if isinstance(data, dict) else None
-        if isinstance(err, dict) and err.get("message"):
-            msg += ": " + str(err["message"])
-        if status == 403:
-            msg += " — 스코프 부족 또는 다른 계정의 사용자 id 입니다. /login 으로 다시 인증하세요."
-        return None, status, msg
-
-    return data.get("id"), status, ""
-
-
-# --- 플레이리스트 쓰기 -----------------------------------------------------
-
-async def replace_playlist(env, playlist_id: str, uris: List[str]) -> bool:
-    """플레이리스트 전체를 좋아요 곡으로 교체하는 함수 (최초 동기화 전용).
-
-    첫 100개는 PUT 으로 보내 기존 트랙을 전부 덮어쓰고(제거 효과), 나머지는
-    100개씩 청크로 나눠 POST 로 이어 붙인다.
-    """
-    first: List[str] = uris[:CHUNK_SIZE]
-    status, data = await spotify_api(
-        env, "PUT", "/playlists/" + playlist_id + "/items", json_body={"uris": first}
-    )
-    if status not in (200, 201):
-        console.log("전체 교체 PUT 실패 status=" + str(status) + " body=" + json.dumps(data))
-        return False
-
-    rest: List[str] = uris[CHUNK_SIZE:]
-    for i in range(0, len(rest), CHUNK_SIZE):
-        chunk: List[str] = rest[i:i + CHUNK_SIZE]
-        status, data = await spotify_api(
-            env, "POST", "/playlists/" + playlist_id + "/items", json_body={"uris": chunk}
-        )
-        if status not in (200, 201):
-            console.log("전체 교체 POST 실패 status=" + str(status) + " body=" + json.dumps(data))
-            return False
-    return True
-
-
-async def add_tracks(env, playlist_id: str, uris: List[str]) -> bool:
-    """플레이리스트에 트랙을 100개씩 청크로 추가하는 함수 (증분 동기화 전용)."""
-    for i in range(0, len(uris), CHUNK_SIZE):
-        chunk: List[str] = uris[i:i + CHUNK_SIZE]
-        status, data = await spotify_api(
-            env, "POST", "/playlists/" + playlist_id + "/items", json_body={"uris": chunk}
-        )
-        if status not in (200, 201):
-            console.log("트랙 추가 실패 status=" + str(status) + " body=" + json.dumps(data))
-            return False
-    return True
-
-
-# --- 메인 동기화 -----------------------------------------------------------
-
-async def sync_playlist(env) -> Dict[str, Any]:
-    """좋아요 곡을 미러 플레이리스트에 동기화하는 메인 함수.
-
-    - 최초 동기화(last_sync_time 없음): 플레이리스트 전체를 교체한다.
-    - 이후 동기화: 플레이리스트에 아직 없는 곡만 새로 추가한다.
-    동기화 후 KV 에 마지막 동기화 시각/곡 수를 저장한다.
-    """
-    playlist_id: Optional[str] = await env.SPOTIFY_KV.get(KV_PLAYLIST)
-    if not playlist_id:
-        msg = "미러 플레이리스트가 선택되지 않았습니다. 대시보드에서 먼저 선택하세요."
-        console.log(msg)
-        return {"ok": False, "error": msg}
-
-    token: Optional[str] = await get_token(env)
-    if not token:
-        msg = "Spotify 인증 정보가 없습니다. /login 으로 다시 연동하세요."
-        console.log(msg)
-        return {"ok": False, "error": msg}
-
-    liked: List[str] = await fetch_liked_songs(env)
-    last_sync: Optional[str] = await env.SPOTIFY_KV.get(KV_LAST_TIME)
-
-    if not last_sync:
-        # 최초 동기화: 전체 교체
-        console.log("최초 동기화: 전체 교체를 수행합니다.")
-        ok: bool = await replace_playlist(env, playlist_id, liked)
-        added: int = len(liked) if ok else 0
-    else:
-        # 증분 동기화: 플레이리스트에 없는 곡만 추가
-        existing: Set[str] = await fetch_playlist_uris(env, playlist_id)
-        new_uris: List[str] = [u for u in liked if u not in existing]
-        console.log("증분 동기화: 신규 " + str(len(new_uris)) + "개 추가")
-        ok = await add_tracks(env, playlist_id, new_uris)
-        added = len(new_uris) if ok else 0
-
-    if not ok:
-        return {"ok": False, "error": "Spotify API 호출에 실패했습니다."}
-
-    now: str = datetime.now(timezone.utc).isoformat()
-    await env.SPOTIFY_KV.put(KV_LAST_TIME, now)
-    await env.SPOTIFY_KV.put(KV_LAST_COUNT, str(len(liked)))
-    console.log("동기화 완료 time=" + now + " total=" + str(len(liked)) + " added=" + str(added))
-
-    return {"ok": True, "last_sync": now, "track_count": len(liked), "added": added}
-
-
-# --- 응답 헬퍼 -------------------------------------------------------------
-
-def json_response(obj: Dict[str, Any], status: int = 200) -> Response:
-    """dict 를 JSON 본문으로 직렬화해 Response 를 만드는 함수."""
+def json_response(obj: Any, status: int = 200) -> Response:
     return Response(
         json.dumps(obj),
         status=status,
@@ -459,125 +99,553 @@ def json_response(obj: Dict[str, Any], status: int = 200) -> Response:
 
 
 async def read_json(request) -> Dict[str, Any]:
-    """요청 본문을 JSON dict 로 파싱하는 함수 (본문이 없거나 깨지면 빈 dict)."""
     try:
         text: str = await request.text()
-        if not text:
-            return {}
-        return json.loads(text)
-    except Exception as exc:  # noqa: BLE001
+        return json.loads(text) if text else {}
+    except (ValueError, TypeError) as exc:
         console.log("요청 본문 파싱 실패: " + str(exc))
         return {}
 
 
-# --- OAuth 핸들러 ----------------------------------------------------------
+def read_cookie(request, name: str) -> Optional[str]:
+    """요청의 Cookie 헤더에서 name 의 값을 꺼낸다 (없으면 None)."""
+    raw = request.headers.get("Cookie") or request.headers.get("cookie") or ""
+    for part in raw.split(";"):
+        kv = part.strip().split("=", 1)
+        if len(kv) == 2 and kv[0] == name:
+            return kv[1]
+    return None
 
-def _origin(request) -> str:
-    """요청 URL 에서 'scheme://host' 형태의 오리진을 추출하는 함수."""
-    parsed = urlparse(request.url)
-    return parsed.scheme + "://" + parsed.netloc
 
+# --- 저수준 HTTP -----------------------------------------------------------
+
+async def http_request(
+    method: str,
+    url: str,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    json_body: Optional[Any] = None,
+    form_body: Optional[Dict[str, str]] = None,
+) -> Tuple[int, Dict[str, Any], Dict[str, str]]:
+    """HTTP 요청 → (status, parsed_body, response_headers).
+
+    JSON 본문이면 application/json, form_body 면 x-www-form-urlencoded 로 보낸다.
+    응답 본문이 JSON 이 아니면 {"_raw": <truncated text>} 로 감싸 반환한다.
+    """
+    h: Dict[str, str] = dict(headers or {})
+    body: Optional[str] = None
+    if json_body is not None:
+        h.setdefault("Content-Type", "application/json")
+        body = json.dumps(json_body)
+    elif form_body is not None:
+        h.setdefault("Content-Type", "application/x-www-form-urlencoded")
+        body = urlencode(form_body)
+
+    opts: Dict[str, Any] = {"method": method, "headers": h}
+    if body is not None:
+        opts["body"] = body
+
+    resp = await fetch(url, to_js_obj(opts))
+    status: int = int(resp.status)
+    text: str = str(await resp.text() or "")
+
+    parsed: Dict[str, Any] = {}
+    if text.strip():
+        try:
+            obj = json.loads(text)
+            parsed = obj if isinstance(obj, dict) else {"_raw": obj}
+        except (ValueError, TypeError):
+            parsed = {"_raw": text[:1000]}
+
+    res_headers: Dict[str, str] = {}
+    try:
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            res_headers["Retry-After"] = str(ra)
+    except Exception:  # noqa: BLE001
+        pass
+
+    return status, parsed, res_headers
+
+
+# --- OAuth & 토큰 ----------------------------------------------------------
+
+def _basic_auth(env) -> str:
+    """Spotify 토큰 엔드포인트용 Basic 인증 헤더 값.
+
+    공식 문서: Authorization: Basic base64(client_id:client_secret)
+    """
+    raw = (str(env.SPOTIFY_CLIENT_ID) + ":" + str(env.SPOTIFY_CLIENT_SECRET)).encode("utf-8")
+    return "Basic " + b64encode(raw).decode("ascii")
+
+
+async def exchange_code(env, code: str, redirect_uri: str) -> Tuple[int, Dict[str, Any]]:
+    """authorization_code 를 access/refresh 토큰으로 교환."""
+    status, data, _ = await http_request(
+        "POST", SPOTIFY_TOKEN_URL,
+        headers={"Authorization": _basic_auth(env)},
+        form_body={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+    )
+    return status, data
+
+
+async def do_refresh(env) -> Optional[str]:
+    """refresh_token 으로 새 access_token 발급하고 KV 에 저장."""
+    rt: Optional[str] = await env.SPOTIFY_KV.get(KV_REFRESH)
+    if not rt:
+        console.log("refresh_token 없음 — /login 필요")
+        return None
+
+    status, data, _ = await http_request(
+        "POST", SPOTIFY_TOKEN_URL,
+        headers={"Authorization": _basic_auth(env)},
+        form_body={"grant_type": "refresh_token", "refresh_token": rt},
+    )
+    if status != 200 or not data.get("access_token"):
+        console.log("토큰 갱신 실패 status=" + str(status) + " body=" + json.dumps(data)[:300])
+        return None
+
+    access: str = data["access_token"]
+    # 공식 문서상 expires_in 은 보통 3600. 안전하게 60초 여유.
+    ttl: int = max(60, int(data.get("expires_in", 3600)) - 60)
+    await env.SPOTIFY_KV.put(KV_ACCESS, access, to_js_obj({"expirationTtl": ttl}))
+
+    new_rt: Optional[str] = data.get("refresh_token")
+    if new_rt and new_rt != rt:
+        await env.SPOTIFY_KV.put(KV_REFRESH, new_rt)
+
+    if data.get("scope"):
+        await env.SPOTIFY_KV.put(KV_SCOPE, data["scope"])
+
+    return access
+
+
+async def get_token(env) -> Optional[str]:
+    """유효한 access_token 반환 (없으면 refresh 시도)."""
+    access: Optional[str] = await env.SPOTIFY_KV.get(KV_ACCESS)
+    if access:
+        return access
+    return await do_refresh(env)
+
+
+# --- Spotify API 호출 ------------------------------------------------------
+
+async def spotify_api(
+    env,
+    method: str,
+    path: str,
+    *,
+    json_body: Optional[Any] = None,
+) -> Tuple[int, Dict[str, Any]]:
+    """access_token 을 붙여 Spotify API 호출. 401 이면 한 번 자동 재시도."""
+    token: Optional[str] = await get_token(env)
+    if not token:
+        return 401, {"error": {"message": "no access token"}}
+
+    url: str = path if path.startswith("http") else SPOTIFY_API_BASE + path
+    headers: Dict[str, str] = {"Authorization": "Bearer " + token}
+    status, data, _ = await http_request(method, url, headers=headers, json_body=json_body)
+
+    if status == 401:
+        token = await do_refresh(env)
+        if not token:
+            return 401, {"error": {"message": "refresh failed"}}
+        headers["Authorization"] = "Bearer " + token
+        status, data, _ = await http_request(method, url, headers=headers, json_body=json_body)
+
+    return status, data
+
+
+# --- Spotify 도메인 함수 ---------------------------------------------------
+
+async def fetch_liked_uris(env) -> List[str]:
+    """GET /me/tracks 를 페이지네이션으로 돌며 모든 좋아요 곡의 URI 수집.
+
+    공식 문서: limit 최대 50, 응답의 next 가 null 이 될 때까지 따라간다.
+    """
+    uris: List[str] = []
+    url: Optional[str] = "/me/tracks?limit=50"
+    while url:
+        status, data = await spotify_api(env, "GET", url)
+        if status != 200:
+            console.log("좋아요 곡 조회 실패 status=" + str(status))
+            break
+        for item in data.get("items", []) or []:
+            track = item.get("track") if isinstance(item, dict) else None
+            if isinstance(track, dict) and track.get("uri"):
+                uris.append(track["uri"])
+        url = data.get("next")
+    console.log("좋아요 곡 " + str(len(uris)) + "개 수집")
+    return uris
+
+
+async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
+    """대상 플레이리스트의 모든 트랙 URI 집합.
+
+    2026 마이그레이션:
+      - 엔드포인트: /playlists/{id}/items
+      - 응답: items[].item (이전: items[].track) — 구버전 응답도 폴백
+    """
+    existing: Set[str] = set()
+    url: Optional[str] = "/playlists/" + playlist_id + "/items?limit=100"
+    while url:
+        status, data = await spotify_api(env, "GET", url)
+        if status != 200:
+            console.log("플레이리스트 트랙 조회 실패 status=" + str(status))
+            break
+        for it in data.get("items", []) or []:
+            entry = it.get("item") or it.get("track") if isinstance(it, dict) else None
+            if isinstance(entry, dict) and entry.get("uri"):
+                existing.add(entry["uri"])
+        url = data.get("next")
+    return existing
+
+
+async def fetch_me(env) -> Optional[Dict[str, Any]]:
+    """현재 토큰 주인의 프로필 (/me)."""
+    status, data = await spotify_api(env, "GET", "/me")
+    if status == 200 and isinstance(data, dict) and data.get("id"):
+        return data
+    console.log("/me 조회 실패 status=" + str(status))
+    return None
+
+
+async def get_user_id(env) -> Optional[str]:
+    """현재 토큰의 user id (필요하면 /me 로 신선한 값을 받아 KV 갱신)."""
+    me = await fetch_me(env)
+    if me and me.get("id"):
+        uid = me["id"]
+        await env.SPOTIFY_KV.put(KV_USER, uid)
+        return uid
+    return await env.SPOTIFY_KV.get(KV_USER)
+
+
+async def list_my_playlists(env) -> Dict[str, Any]:
+    """GET /me/playlists 페이지네이션 (편집 가능 여부 표시)."""
+    user_id: Optional[str] = await get_user_id(env)
+    items: List[Dict[str, Any]] = []
+    url: Optional[str] = "/me/playlists?limit=50"
+    total: int = 0
+    first: bool = True
+    spotify_err: str = ""
+    last_status: int = 200
+
+    while url:
+        status, data = await spotify_api(env, "GET", url)
+        last_status = status
+        if first:
+            first = False
+            try:
+                total = int(data.get("total") or 0)
+            except (ValueError, TypeError):
+                total = 0
+        if status != 200:
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict):
+                spotify_err = str(err.get("message") or "")
+            elif isinstance(err, str):
+                spotify_err = err
+            console.log("/me/playlists 실패 status=" + str(status) + " err=" + spotify_err)
+            return {
+                "status": status, "playlists": items, "total": total,
+                "user_id": user_id, "spotify_error": spotify_err,
+            }
+        for pl in data.get("items", []) or []:
+            owner = (pl.get("owner") or {}).get("id")
+            tracks = pl.get("tracks") or pl.get("items") or {}
+            items.append({
+                "id": pl.get("id"),
+                "name": pl.get("name"),
+                "owner": owner,
+                "editable": (owner == user_id) or bool(pl.get("collaborative")),
+                "tracks": int(tracks.get("total") or 0),
+            })
+        url = data.get("next")
+
+    return {
+        "status": last_status, "playlists": items, "total": total,
+        "user_id": user_id, "spotify_error": "",
+    }
+
+
+async def create_my_playlist(env, name: str) -> Tuple[Optional[str], int, str]:
+    """공개 플레이리스트를 새로 만든다 (POST /me/playlists).
+
+    2026 마이그레이션 이후 POST /users/{id}/playlists 는 제거되었다.
+    """
+    body: Dict[str, Any] = {
+        "name": name,
+        "public": True,
+        "description": "좋아요 표시한 곡 자동 미러 (spotify-sync)",
+    }
+    status, data = await spotify_api(env, "POST", "/me/playlists", json_body=body)
+    if status not in (200, 201) or not (isinstance(data, dict) and data.get("id")):
+        err_msg = ""
+        if isinstance(data.get("error"), dict):
+            err_msg = str(data["error"].get("message") or "")
+        msg = "플레이리스트 생성 실패 (status " + str(status) + ")"
+        if err_msg:
+            msg += ": " + err_msg
+        if status == 403:
+            msg += " — playlist-modify-public scope 부족이거나 앱이 Development Mode 인지 확인하세요."
+        console.log(msg)
+        return None, status, msg
+    return data["id"], status, ""
+
+
+async def replace_playlist(env, playlist_id: str, uris: List[str]) -> bool:
+    """플레이리스트 전체를 uris 로 교체 (최초 동기화).
+
+    PUT /playlists/{id}/items 로 첫 100개를 보내 기존 트랙을 덮어쓰고
+    (uris=[] 도 허용), 나머지는 POST 로 100개씩 이어 붙인다.
+    """
+    head = uris[:CHUNK_SIZE]
+    status, data = await spotify_api(
+        env, "PUT", "/playlists/" + playlist_id + "/items",
+        json_body={"uris": head},
+    )
+    if status not in (200, 201):
+        console.log("전체 교체 PUT 실패 status=" + str(status) + " body=" + json.dumps(data)[:300])
+        return False
+
+    for i in range(CHUNK_SIZE, len(uris), CHUNK_SIZE):
+        chunk = uris[i:i + CHUNK_SIZE]
+        status, data = await spotify_api(
+            env, "POST", "/playlists/" + playlist_id + "/items",
+            json_body={"uris": chunk},
+        )
+        if status not in (200, 201):
+            console.log("전체 교체 POST 실패 status=" + str(status) + " body=" + json.dumps(data)[:300])
+            return False
+    return True
+
+
+async def append_tracks(env, playlist_id: str, uris: List[str]) -> bool:
+    """플레이리스트에 100개씩 청크로 트랙을 추가 (증분 동기화)."""
+    for i in range(0, len(uris), CHUNK_SIZE):
+        chunk = uris[i:i + CHUNK_SIZE]
+        status, data = await spotify_api(
+            env, "POST", "/playlists/" + playlist_id + "/items",
+            json_body={"uris": chunk},
+        )
+        if status not in (200, 201):
+            console.log("트랙 추가 실패 status=" + str(status) + " body=" + json.dumps(data)[:300])
+            return False
+    return True
+
+
+# --- 메인 동기화 -----------------------------------------------------------
+
+async def sync_now(env) -> Dict[str, Any]:
+    """좋아요 곡을 미러 플레이리스트에 동기화하고 결과 dict 반환."""
+    playlist_id: Optional[str] = await env.SPOTIFY_KV.get(KV_PLAYLIST)
+    if not playlist_id:
+        return {"ok": False, "error": "미러 플레이리스트가 선택되지 않았습니다. 대시보드에서 먼저 선택하세요."}
+
+    if not await get_token(env):
+        return {"ok": False, "error": "Spotify 인증 정보가 없습니다. /login 으로 다시 연동하세요."}
+
+    liked = await fetch_liked_uris(env)
+    last_sync: Optional[str] = await env.SPOTIFY_KV.get(KV_LAST_TIME)
+
+    if not last_sync:
+        console.log("최초 동기화: 전체 교체")
+        ok = await replace_playlist(env, playlist_id, liked)
+        added = len(liked) if ok else 0
+    else:
+        existing = await fetch_playlist_uris(env, playlist_id)
+        new_uris = [u for u in liked if u not in existing]
+        console.log("증분 동기화: 신규 " + str(len(new_uris)) + "개")
+        ok = await append_tracks(env, playlist_id, new_uris)
+        added = len(new_uris) if ok else 0
+
+    if not ok:
+        return {"ok": False, "error": "Spotify API 호출 실패"}
+
+    now = datetime.now(timezone.utc).isoformat()
+    await env.SPOTIFY_KV.put(KV_LAST_TIME, now)
+    await env.SPOTIFY_KV.put(KV_LAST_COUNT, str(len(liked)))
+    console.log("동기화 완료 time=" + now + " total=" + str(len(liked)) + " added=" + str(added))
+    return {"ok": True, "last_sync": now, "track_count": len(liked), "added": added}
+
+
+# --- 라우트 핸들러 ---------------------------------------------------------
 
 async def handle_login(request, env) -> Response:
-    """Spotify 인증 페이지로 리다이렉트하는 함수."""
-    redirect_uri: str = _origin(request) + "/callback"
-    params: Dict[str, str] = {
+    """Spotify Authorization Code Flow 시작.
+
+    공식 문서: response_type=code, scope, redirect_uri, state (CSRF), show_dialog 옵션.
+    state 는 HttpOnly·Secure·SameSite=Lax 쿠키로 보존해 콜백에서 검증한다.
+    (KV 는 eventually consistent 라 cross-edge 콜백에서 못 읽을 수 있음.)
+    """
+    state = secrets.token_urlsafe(24)
+    params = {
         "client_id": str(env.SPOTIFY_CLIENT_ID),
         "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": SCOPE,
+        "redirect_uri": origin_of(request) + "/callback",
+        "scope": SCOPE_STR,
+        "state": state,
         "show_dialog": "true",
     }
-    auth_url: str = SPOTIFY_AUTH_URL + "?" + urlencode(params)
-    return Response.redirect(auth_url, 302)
+    cookie = (
+        OAUTH_STATE_COOKIE + "=" + state
+        + "; Path=/callback; Max-Age=600; HttpOnly; Secure; SameSite=Lax"
+    )
+    return Response(
+        None,
+        status=302,
+        headers={
+            "Location": SPOTIFY_AUTH_URL + "?" + urlencode(params),
+            "Set-Cookie": cookie,
+        },
+    )
 
 
 async def handle_callback(request, env) -> Response:
-    """OAuth 콜백을 처리해 토큰을 발급받아 KV 에 저장하는 함수."""
-    parsed = urlparse(request.url)
-    qs = parse_qs(parsed.query)
-    error: Optional[str] = qs.get("error", [None])[0]
-    code: Optional[str] = qs.get("code", [None])[0]
+    """OAuth 콜백: code → 토큰 교환, KV 저장."""
+    qs = parse_qs(urlparse(request.url).query)
+    error = qs.get("error", [None])[0]
+    code = qs.get("code", [None])[0]
+    state = qs.get("state", [None])[0]
 
     if error:
-        return Response("인증이 거부되었습니다: " + error, status=400)
+        return Response("인증 거부: " + error, status=400)
     if not code:
         return Response("code 파라미터가 없습니다.", status=400)
+    if not state:
+        return Response("state 파라미터가 없습니다.", status=400)
 
-    redirect_uri: str = _origin(request) + "/callback"
-    form: Dict[str, str] = {
-        "grant_type": "authorization_code",
-        "code": code,
-        "redirect_uri": redirect_uri,
-        "client_id": str(env.SPOTIFY_CLIENT_ID),
-        "client_secret": str(env.SPOTIFY_CLIENT_SECRET),
-    }
-    status, data = await http_request("POST", SPOTIFY_TOKEN_URL, form_body=form)
-    if status != 200:
-        console.log("토큰 발급 실패 status=" + str(status) + " body=" + json.dumps(data))
+    # CSRF 방어: 쿠키의 state 와 URL state 가 일치해야 한다.
+    cookie_state = read_cookie(request, OAUTH_STATE_COOKIE)
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        return Response("state 가 유효하지 않거나 만료되었습니다.", status=400)
+
+    redirect_uri = origin_of(request) + "/callback"
+    status, data = await exchange_code(env, code, redirect_uri)
+    if status != 200 or not data.get("access_token"):
         return Response(
-            "토큰 발급 실패 (status " + str(status) + "): " + json.dumps(data),
+            "토큰 발급 실패 (status " + str(status) + "): " + json.dumps(data)[:500],
             status=400,
         )
 
-    access: Optional[str] = data.get("access_token")
-    if not access:
-        console.log("토큰 발급 응답에 access_token 이 없음 body=" + json.dumps(data))
-        return Response(
-            "토큰 발급 응답이 올바르지 않습니다: " + json.dumps(data),
-            status=400,
-        )
-    refresh: Optional[str] = data.get("refresh_token")
-    granted_scope: str = data.get("scope") or ""
-    console.log("토큰 발급 완료. 부여된 scope=" + granted_scope)
-    await env.SPOTIFY_KV.put(KV_ACCESS, access, to_js_obj({"expirationTtl": 3600}))
-    await env.SPOTIFY_KV.put(KV_SCOPE, granted_scope)
-    if refresh:
-        await env.SPOTIFY_KV.put(KV_REFRESH, refresh)
+    access = data["access_token"]
+    ttl = max(60, int(data.get("expires_in", 3600)) - 60)
+    await env.SPOTIFY_KV.put(KV_ACCESS, access, to_js_obj({"expirationTtl": ttl}))
+    if data.get("refresh_token"):
+        await env.SPOTIFY_KV.put(KV_REFRESH, data["refresh_token"])
+    if data.get("scope"):
+        await env.SPOTIFY_KV.put(KV_SCOPE, data["scope"])
 
-    # 사용자 id 저장 (플레이리스트 생성/소유 판별에 사용)
-    ustatus, udata = await http_request("GET", SPOTIFY_API_BASE + "/me", token=access)
-    if ustatus == 200 and udata.get("id"):
-        await env.SPOTIFY_KV.put(KV_USER, udata["id"])
+    # 사용자 id 도 즉시 저장
+    _, me, _ = await http_request(
+        "GET", SPOTIFY_API_BASE + "/me",
+        headers={"Authorization": "Bearer " + access},
+    )
+    if isinstance(me, dict) and me.get("id"):
+        await env.SPOTIFY_KV.put(KV_USER, me["id"])
 
-    console.log("OAuth 연동 완료")
-    return Response.redirect(_origin(request) + "/", 302)
+    console.log("OAuth 연동 완료, scope=" + str(data.get("scope") or ""))
+    # 쿠키 state 는 일회용 — 응답에서 즉시 만료시킨다.
+    clear_cookie = (
+        OAUTH_STATE_COOKIE + "=; Path=/callback; Max-Age=0; HttpOnly; Secure; SameSite=Lax"
+    )
+    return Response(
+        None,
+        status=302,
+        headers={
+            "Location": origin_of(request) + "/",
+            "Set-Cookie": clear_cookie,
+        },
+    )
 
 
 async def handle_status(env) -> Response:
-    """동기화 상태를 JSON 으로 반환하는 함수 (공개 엔드포인트)."""
     refresh: Optional[str] = await env.SPOTIFY_KV.get(KV_REFRESH)
-    synced: bool = refresh is not None
-
     last_sync: str = (await env.SPOTIFY_KV.get(KV_LAST_TIME)) or ""
-    count_str: Optional[str] = await env.SPOTIFY_KV.get(KV_LAST_COUNT)
-    track_count: int = int(count_str) if count_str else 0
-
+    count_s: Optional[str] = await env.SPOTIFY_KV.get(KV_LAST_COUNT)
     playlist_id: Optional[str] = await env.SPOTIFY_KV.get(KV_PLAYLIST)
-    playlist_url: str = ("https://open.spotify.com/playlist/" + playlist_id) if playlist_id else ""
-
     scope: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
-
-    payload: Dict[str, Any] = {
-        "synced": synced,
+    return json_response({
+        "synced": refresh is not None,
         "last_sync": last_sync,
-        "track_count": track_count,
-        "playlist_url": playlist_url,
+        "track_count": int(count_s) if count_s else 0,
+        "playlist_url": ("https://open.spotify.com/playlist/" + playlist_id) if playlist_id else "",
         "playlist_id": playlist_id or "",
         "scope": scope,
-    }
-    return json_response(payload)
+    })
 
 
-# --- 라우팅 ----------------------------------------------------------------
+async def handle_playlists(env) -> Response:
+    res = await list_my_playlists(env)
+    status = res["status"]
+    if status != 200:
+        granted: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
+        granted_set = set(granted.split()) if granted else set()
+        missing = sorted(REQUIRED_SCOPES - granted_set)
+        msg = "Spotify 플레이리스트 조회 실패 (status " + str(status) + ")"
+        if res.get("spotify_error"):
+            msg += ": " + res["spotify_error"]
+        if missing:
+            msg += " · 미부여 scope: " + ", ".join(missing) + ". /login 으로 다시 인증하세요."
+        elif status == 403:
+            msg += " · 앱이 Development Mode 일 가능성. Developer Dashboard 에서 본인 계정을 User Management 에 추가하세요."
+        return json_response({
+            "playlists": [], "total": res.get("total", 0),
+            "user_id": res.get("user_id") or "",
+            "error": msg, "missing_scope": missing,
+            "granted_scope": granted,
+            "spotify_error": res.get("spotify_error", ""),
+        }, status=status)
+    return json_response({
+        "playlists": res["playlists"],
+        "total": res.get("total", 0),
+        "user_id": res.get("user_id") or "",
+    })
+
+
+async def handle_select(request, env) -> Response:
+    body = await read_json(request)
+    pid = body.get("playlist_id")
+    if not pid:
+        return json_response({"ok": False, "error": "playlist_id 가 필요합니다."}, status=400)
+    await env.SPOTIFY_KV.put(KV_PLAYLIST, pid)
+    # 다른 플레이리스트로 바꾸면 다음 동기화를 전체 교체로 다시 시작
+    await env.SPOTIFY_KV.delete(KV_LAST_TIME)
+    await env.SPOTIFY_KV.delete(KV_LAST_COUNT)
+    console.log("미러 선택: " + pid)
+    return json_response({"ok": True, "playlist_id": pid})
+
+
+async def handle_create(request, env) -> Response:
+    body = await read_json(request)
+    name = (body.get("name") or "").strip() or "좋아요 미러"
+    new_id, status, err = await create_my_playlist(env, name)
+    if not new_id:
+        http_status = status if status in (401, 403, 404) else 400
+        return json_response({"ok": False, "error": err or "생성 실패"}, status=http_status)
+    await env.SPOTIFY_KV.put(KV_PLAYLIST, new_id)
+    await env.SPOTIFY_KV.delete(KV_LAST_TIME)
+    await env.SPOTIFY_KV.delete(KV_LAST_COUNT)
+    console.log("미러 생성: " + new_id)
+    return json_response({"ok": True, "playlist_id": new_id})
+
+
+async def handle_sync(env) -> Response:
+    result = await sync_now(env)
+    return json_response(result, status=200 if result.get("ok") else 400)
+
+
+# --- 라우터 ----------------------------------------------------------------
 
 async def handle_fetch(request, env) -> Response:
-    """들어온 HTTP 요청을 경로/메서드에 따라 분기 처리하는 함수."""
-    parsed = urlparse(request.url)
-    path: str = parsed.path
-    method: str = request.method
+    path = urlparse(request.url).path
+    method = request.method
 
-    # 공개 경로 (Cloudflare Access 보호 제외)
+    # 공개 경로
     if path == "/login":
         return await handle_login(request, env)
     if path == "/callback":
@@ -587,9 +655,8 @@ async def handle_fetch(request, env) -> Response:
     if path == "/favicon.ico":
         return Response(None, status=204)
 
-    # Cloudflare Access JWT 헤더 검증 (헤더 존재 여부만 확인)
-    jwt: Optional[str] = request.headers.get("CF-Access-Jwt-Assertion")
-    if not jwt:
+    # Cloudflare Access JWT 헤더 존재 확인 (서명 검증은 Access 가 처리)
+    if not request.headers.get("CF-Access-Jwt-Assertion"):
         return Response(
             "403 Forbidden: Cloudflare Access 인증이 필요한 경로입니다.",
             status=403,
@@ -597,84 +664,19 @@ async def handle_fetch(request, env) -> Response:
 
     if path == "/" and method == "GET":
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html; charset=utf-8"})
-
     if path == "/playlists" and method == "GET":
-        res = await list_playlists(env)
-        status = res["status"]
-        playlists = res["playlists"]
-        spotify_err = res["spotify_error"]
-        total = res["total"]
-        user_id = res["user_id"]
-        if status != 200:
-            granted: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
-            granted_set: Set[str] = set(granted.split()) if granted else set()
-            missing: List[str] = sorted(REQUIRED_SCOPES - granted_set)
-            detail = "Spotify 플레이리스트 조회 실패 (status " + str(status) + ")"
-            if spotify_err:
-                detail += ": " + spotify_err
-            detail += "."
-            if missing:
-                detail += (
-                    " 부여되지 않은 scope: " + ", ".join(missing)
-                    + ". /login 으로 다시 인증해 모든 권한을 허용하세요."
-                )
-            elif status == 403:
-                detail += (
-                    " 모든 scope 가 부여돼 있는데도 403 이면, Spotify 앱이 Development Mode 일 가능성이 큽니다."
-                    " Spotify Developer Dashboard 의 해당 앱 → User Management 에 본인 계정(이메일)을 추가하세요."
-                )
-            return json_response({
-                "playlists": [],
-                "total": total,
-                "user_id": user_id or "",
-                "error": detail,
-                "granted_scope": granted,
-                "missing_scope": missing,
-                "spotify_error": spotify_err,
-                "first_page_keys": res["first_page_keys"],
-                "first_page_raw": res["first_page_raw"],
-            }, status=status)
-        return json_response({
-            "playlists": playlists,
-            "total": total,
-            "user_id": user_id or "",
-            "first_page_keys": res["first_page_keys"],
-            "first_page_raw": res["first_page_raw"],
-        })
-
+        return await handle_playlists(env)
     if path == "/select" and method == "POST":
-        body = await read_json(request)
-        pid: Optional[str] = body.get("playlist_id")
-        if not pid:
-            return json_response({"ok": False, "error": "playlist_id 가 필요합니다."}, status=400)
-        await env.SPOTIFY_KV.put(KV_PLAYLIST, pid)
-        # 새 플레이리스트로 바꾸면 다음 동기화를 전체 교체로 다시 시작한다.
-        await env.SPOTIFY_KV.delete(KV_LAST_TIME)
-        await env.SPOTIFY_KV.delete(KV_LAST_COUNT)
-        console.log("미러 플레이리스트 선택: " + pid)
-        return json_response({"ok": True, "playlist_id": pid})
-
+        return await handle_select(request, env)
     if path == "/create" and method == "POST":
-        body = await read_json(request)
-        name: str = body.get("name") or "좋아요 미러"
-        new_id, cstatus, cerr = await create_playlist(env, name)
-        if not new_id:
-            http_status = cstatus if cstatus in (401, 403, 404) else 400
-            return json_response({"ok": False, "error": cerr or "플레이리스트 생성 실패"}, status=http_status)
-        await env.SPOTIFY_KV.put(KV_PLAYLIST, new_id)
-        await env.SPOTIFY_KV.delete(KV_LAST_TIME)
-        await env.SPOTIFY_KV.delete(KV_LAST_COUNT)
-        console.log("미러 플레이리스트 생성: " + new_id)
-        return json_response({"ok": True, "playlist_id": new_id})
-
+        return await handle_create(request, env)
     if path == "/sync" and method == "POST":
-        result = await sync_playlist(env)
-        return json_response(result, status=200 if result.get("ok") else 400)
+        return await handle_sync(env)
 
     return Response("404 Not Found", status=404)
 
 
-# --- 대시보드 HTML ---------------------------------------------------------
+# --- 대시보드 --------------------------------------------------------------
 
 DASHBOARD_HTML: str = """<!doctype html>
 <html lang="ko">
@@ -683,7 +685,6 @@ DASHBOARD_HTML: str = """<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Spotify Sync</title>
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
-  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" integrity="sha384-FKyoEForCGlyvwx9Hj09JcYn3nv7wiPVlz7YYwJrWVcXK/BmnVDxM+D2scQbITxI" crossorigin="anonymous"></script>
 </head>
 <body class="bg-light">
   <div class="container py-5" style="max-width: 720px;">
@@ -696,7 +697,7 @@ DASHBOARD_HTML: str = """<!doctype html>
         <p class="mb-2">마지막 동기화: <span id="lastSync">-</span></p>
         <p class="mb-2">동기화된 트랙 수: <span id="trackCount">0</span></p>
         <p class="mb-0">미러 플레이리스트:
-          <a id="playlistLink" href="#" target="_blank" style="display:none;"></a>
+          <a id="playlistLink" href="#" target="_blank" rel="noopener" style="display:none;"></a>
           <span id="noPlaylist" class="text-muted">선택되지 않음</span>
         </p>
       </div>
@@ -704,11 +705,11 @@ DASHBOARD_HTML: str = """<!doctype html>
 
     <div class="card mb-3" id="playlistCard" style="display:none;">
       <div class="card-body">
-        <h5 class="card-title">미러 플레이리스트 선택</h5>
+        <h5 class="card-title">미러 플레이리스트</h5>
         <div class="d-flex gap-2 align-items-center flex-wrap">
           <select id="playlistSelect" class="form-select" style="max-width: 360px;"></select>
           <button class="btn btn-outline-primary" onclick="savePlaylist()">선택 저장</button>
-          <button class="btn btn-outline-success" onclick="createPlaylist()">새 플레이리스트 생성</button>
+          <button class="btn btn-outline-success" onclick="createPlaylist()">새로 만들기</button>
         </div>
         <small id="playlistHint" class="text-muted d-block mt-2"></small>
       </div>
@@ -722,13 +723,10 @@ DASHBOARD_HTML: str = """<!doctype html>
 
   <script>
     async function loadStatus() {
-      const res = await fetch('/status');
-      const s = await res.json();
-
+      const s = await (await fetch('/status')).json();
       const conn = document.getElementById('conn');
       conn.textContent = s.synced ? '연동됨' : '연동 안됨';
       conn.className = s.synced ? 'badge bg-success' : 'badge bg-secondary';
-
       document.getElementById('lastSync').textContent = s.last_sync || '없음';
       document.getElementById('trackCount').textContent = s.track_count;
 
@@ -743,9 +741,8 @@ DASHBOARD_HTML: str = """<!doctype html>
         link.style.display = 'none';
         none.style.display = 'inline';
       }
-
       document.getElementById('playlistCard').style.display = s.synced ? 'block' : 'none';
-      if (s.synced) { loadPlaylists(s.playlist_id); }
+      if (s.synced) loadPlaylists(s.playlist_id);
     }
 
     async function loadPlaylists(current) {
@@ -753,72 +750,27 @@ DASHBOARD_HTML: str = """<!doctype html>
       const hint = document.getElementById('playlistHint');
       hint.textContent = '';
       let res;
-      try {
-        res = await fetch('/playlists');
-      } catch (e) {
-        hint.textContent = '목록 요청 중 오류: ' + e;
-        return;
-      }
+      try { res = await fetch('/playlists'); }
+      catch (e) { hint.textContent = '요청 오류: ' + e; return; }
       let data = {};
-      try { data = await res.json(); } catch (e) { /* 본문 없음 */ }
+      try { data = await res.json(); } catch (e) {}
       if (!res.ok) {
         sel.innerHTML = '';
-        hint.textContent = data.error
-          || ('목록을 불러오지 못했습니다 (HTTP ' + res.status
-              + '). Spotify 연동 상태와 Cloudflare Access 설정을 확인하세요.');
+        hint.textContent = data.error || ('목록 로드 실패 (HTTP ' + res.status + ')');
         return;
       }
       const lists = data.playlists || [];
-      const total = (typeof data.total === 'number') ? data.total : 0;
-      const userId = data.user_id || '';
       sel.innerHTML = '';
       if (lists.length === 0) {
-        hint.innerHTML = '';
-        const intro = document.createElement('div');
-        if (total > 0) {
-          intro.textContent = 'Spotify 는 ' + total + '개의 플레이리스트가 있다고 보고했지만 응답에 항목이 비어 있습니다. user_id=' + userId;
-        } else {
-          intro.textContent = '이 토큰의 Spotify 응답에 플레이리스트가 0개로 옵니다 (user_id=' + userId + ').'
-            + ' "Liked Songs"는 /me/playlists 에 포함되지 않습니다.';
-        }
-        hint.appendChild(intro);
-
-        if (userId) {
-          const linkLine = document.createElement('div');
-          linkLine.className = 'mt-1';
-          const a = document.createElement('a');
-          a.href = 'https://open.spotify.com/user/' + encodeURIComponent(userId);
-          a.target = '_blank';
-          a.rel = 'noopener';
-          a.textContent = 'open.spotify.com/user/' + userId;
-          linkLine.appendChild(document.createTextNode('이 user_id 의 Spotify 프로필 → '));
-          linkLine.appendChild(a);
-          linkLine.appendChild(document.createTextNode(' 에서 의도한 계정/플레이리스트가 보이는지 확인하세요.'));
-          hint.appendChild(linkLine);
-        }
-
-        if (data.first_page_raw) {
-          const details = document.createElement('details');
-          details.className = 'mt-2';
-          const summary = document.createElement('summary');
-          summary.textContent = 'Spotify 응답 raw 보기 (디버그)';
-          const pre = document.createElement('pre');
-          pre.className = 'mt-2 small';
-          pre.style.whiteSpace = 'pre-wrap';
-          pre.style.wordBreak = 'break-all';
-          pre.textContent = 'keys=' + ((data.first_page_keys || []).join(',')) + '\n\n' + data.first_page_raw;
-          details.appendChild(summary);
-          details.appendChild(pre);
-          hint.appendChild(details);
-        }
+        hint.textContent = '플레이리스트가 없습니다 (user_id=' + (data.user_id || '') + ').';
         return;
       }
-      lists.forEach(function (p) {
+      lists.forEach(p => {
         const opt = document.createElement('option');
         opt.value = p.id;
         opt.textContent = p.name + ' (' + p.tracks + '곡)' + (p.editable ? '' : ' [편집불가]');
-        if (!p.editable) { opt.disabled = true; }
-        if (p.id === current) { opt.selected = true; }
+        if (!p.editable) opt.disabled = true;
+        if (p.id === current) opt.selected = true;
         sel.appendChild(opt);
       });
     }
@@ -827,25 +779,25 @@ DASHBOARD_HTML: str = """<!doctype html>
       const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
       });
       let body = {};
-      try { body = await res.json(); } catch (e) { /* 본문 없음 */ }
-      return { ok: res.ok, status: res.status, body: body };
+      try { body = await res.json(); } catch (e) {}
+      return { ok: res.ok, status: res.status, body };
     }
 
     async function savePlaylist() {
       const pid = document.getElementById('playlistSelect').value;
-      if (!pid) { return; }
+      if (!pid) return;
       const r = await postJson('/select', { playlist_id: pid });
       alert(r.ok ? '저장되었습니다.' : ('저장 실패: ' + (r.body.error || ('HTTP ' + r.status))));
       loadStatus();
     }
 
     async function createPlaylist() {
-      const name = prompt('새 플레이리스트 이름을 입력하세요.', '좋아요 미러');
-      if (!name) { return; }
-      const r = await postJson('/create', { name: name });
+      const name = prompt('새 플레이리스트 이름', '좋아요 미러');
+      if (!name) return;
+      const r = await postJson('/create', { name });
       alert(r.ok ? '생성되었습니다.' : ('생성 실패: ' + (r.body.error || ('HTTP ' + r.status))));
       loadStatus();
     }
@@ -855,13 +807,9 @@ DASHBOARD_HTML: str = """<!doctype html>
       btn.disabled = true;
       btn.textContent = '동기화 중...';
       try {
-        const res = await fetch('/sync', { method: 'POST' });
-        const r = await res.json();
-        if (r.ok) {
-          alert('동기화 완료: 총 ' + r.track_count + '곡 (신규 ' + r.added + '곡)');
-        } else {
-          alert('동기화 실패: ' + (r.error || '알 수 없는 오류'));
-        }
+        const r = await (await fetch('/sync', { method: 'POST' })).json();
+        if (r.ok) alert('완료: 총 ' + r.track_count + '곡 (신규 ' + r.added + '곡)');
+        else alert('실패: ' + (r.error || '알 수 없는 오류'));
       } finally {
         btn.disabled = false;
         btn.textContent = '지금 동기화';
@@ -879,10 +827,9 @@ DASHBOARD_HTML: str = """<!doctype html>
 # --- Worker 엔트리포인트 ---------------------------------------------------
 
 class Default(WorkerEntrypoint):
-    """Cloudflare Worker 진입점. fetch(HTTP)와 scheduled(cron)를 처리한다."""
+    """fetch (HTTP) 와 scheduled (cron) 진입점."""
 
     async def fetch(self, request) -> Response:
-        """들어온 HTTP 요청을 처리하고, 예외는 500 응답으로 감싸는 핸들러."""
         try:
             return await handle_fetch(request, self.env)
         except Exception as exc:  # noqa: BLE001
@@ -890,7 +837,6 @@ class Default(WorkerEntrypoint):
             return Response("500 Internal Server Error: " + str(exc), status=500)
 
     async def scheduled(self, controller, env=None, ctx=None) -> None:
-        """매일 cron 트리거로 자동 동기화를 수행하는 핸들러."""
         console.log("cron 동기화 시작")
-        result = await sync_playlist(env or self.env)
-        console.log("cron 동기화 결과: " + json.dumps(result))
+        result = await sync_now(env or self.env)
+        console.log("cron 결과: " + json.dumps(result))

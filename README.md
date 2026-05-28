@@ -115,8 +115,19 @@ spotify-sync/
 
 ## 동작 요약
 
-- `fetch_liked_songs()` — `GET /me/tracks` 를 `limit=50` 으로 페이지네이션(while)하며 전체 URI 수집
-- `get_token()` / `refresh_token()` — access_token(TTL 3600초) 관리 및 자동 갱신
-- `sync_playlist()` — 최초엔 `PUT`(전체 교체) + `POST`(100개씩 청크), 이후엔 신규 곡만 `POST` 추가
+- 인증: Authorization Code Flow (`state` CSRF 토큰 + Basic 인증 헤더로 토큰 교환)
+- `fetch_liked_uris()` — `GET /me/tracks?limit=50` 페이지네이션 (`next` 따라가기)
+- `get_token()` / `do_refresh()` — access_token(TTL ~3540s) 관리 및 401 자동 재시도
+- `sync_now()` — 최초엔 `PUT /playlists/{id}/items` 로 전체 교체 + 100개씩 `POST` 청크, 이후엔 신규 곡만 추가
+- `create_my_playlist()` — `POST /me/playlists` (2026 마이그레이션으로 `POST /users/{id}/playlists` 는 제거됨)
+- `fetch_playlist_uris()` — `GET /playlists/{id}/items` (응답 키 `items[].item`, 구버전 `items[].track` 폴백)
 - 동기화 후 `spotify:last_sync_time`(ISO8601), `spotify:last_sync_count` 를 KV 에 저장
 - `[observability]` 활성화로 `console.log` 가 전부 수집됩니다.
+
+## 참고 문서
+
+- [Authorization Code Flow](https://developer.spotify.com/documentation/web-api/tutorials/code-flow)
+- [Refreshing tokens](https://developer.spotify.com/documentation/web-api/tutorials/refreshing-tokens)
+- [February 2026 Migration Guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide)
+  - `/playlists/{id}/tracks` → `/playlists/{id}/items` (응답: `tracks→items`, `tracks.track→items.item`)
+  - `POST /users/{id}/playlists` 제거 → `POST /me/playlists`
