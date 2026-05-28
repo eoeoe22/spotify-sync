@@ -251,11 +251,18 @@ async def get_user_id(env) -> Optional[str]:
     return await env.SPOTIFY_KV.get(KV_USER)
 
 
-async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str, int, Optional[str]]:
-    """현재 사용자의 플레이리스트 목록을 (상태, list, Spotify 오류, total, user_id)로 반환하는 함수.
+async def list_playlists(env) -> Dict[str, Any]:
+    """현재 사용자의 플레이리스트 목록과 메타 정보를 dict 로 반환하는 함수.
 
-    Spotify 가 보고한 `total` 도 함께 돌려주어, items 가 비어 있을 때 '정말 0 개'와
-    'Spotify 는 N 개라고 하는데 화면엔 안 옴'을 구분할 수 있게 한다.
+    반환 키:
+      status: 마지막 Spotify HTTP 상태
+      playlists: 수집한 플레이리스트 dict 의 리스트
+      spotify_error: 실패 시 error.message (없으면 "")
+      total: Spotify 가 보고한 총 플레이리스트 수
+      user_id: 현재 토큰의 Spotify user id
+      first_page_keys: 첫 페이지 응답의 최상위 키 목록 (구조 변경 진단용)
+      first_page_raw: 첫 페이지 응답 본문 (truncate). 항목이 비어 있을 때 사용자가
+        직접 확인하고 싶을 수 있어 응답에 실어둔다.
     """
     user_id: Optional[str] = await get_user_id(env)
     result: List[Dict[str, Any]] = []
@@ -263,6 +270,8 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str, int, Opti
     spotify_err: str = ""
     total: int = 0
     first_page: bool = True
+    first_page_keys: List[str] = []
+    first_page_raw: str = ""
 
     while url:
         status, data = await spotify_api(env, "GET", url)
@@ -273,16 +282,17 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str, int, Opti
                     total = int(data.get("total") or 0)
                 except (ValueError, TypeError):
                     total = 0
-                # 빈 items 에 대한 디버깅을 위해 첫 페이지 응답을 일부 잘라 로그로 남긴다.
                 items_len: int = len(data.get("items", []) or [])
+                first_page_keys = list(data.keys())[:20]
+                first_page_raw = json.dumps(data)[:1500]
                 console.log(
                     "/me/playlists 첫 페이지 status=" + str(status)
                     + " user_id=" + str(user_id) + " total=" + str(total)
                     + " items_in_page=" + str(items_len)
-                    + " keys=" + ",".join(list(data.keys())[:10])
+                    + " keys=" + ",".join(first_page_keys)
                 )
-                if status == 200 and items_len == 0 and total == 0:
-                    console.log("응답 raw=" + json.dumps(data)[:800])
+                if status == 200 and items_len == 0:
+                    console.log("응답 raw=" + first_page_raw)
         if status != 200:
             console.log(
                 "플레이리스트 목록 조회 실패 status=" + str(status)
@@ -293,7 +303,11 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str, int, Opti
                 spotify_err = str(err["message"])
             elif isinstance(err, str):
                 spotify_err = err
-            return status, result, spotify_err, total, user_id
+            return {
+                "status": status, "playlists": result, "spotify_error": spotify_err,
+                "total": total, "user_id": user_id,
+                "first_page_keys": first_page_keys, "first_page_raw": first_page_raw,
+            }
         for pl in data.get("items", []):
             owner_id: Optional[str] = (pl.get("owner") or {}).get("id")
             editable: bool = (owner_id == user_id) or bool(pl.get("collaborative"))
@@ -309,7 +323,11 @@ async def list_playlists(env) -> Tuple[int, List[Dict[str, Any]], str, int, Opti
     console.log("플레이리스트 " + str(len(result)) + "개 조회. user_id="
                 + str(user_id) + " total=" + str(total)
                 + " 샘플=" + json.dumps(result[:3]))
-    return 200, result, "", total, user_id
+    return {
+        "status": 200, "playlists": result, "spotify_error": "",
+        "total": total, "user_id": user_id,
+        "first_page_keys": first_page_keys, "first_page_raw": first_page_raw,
+    }
 
 
 async def create_playlist(env, name: str) -> Tuple[Optional[str], int, str]:
@@ -581,7 +599,12 @@ async def handle_fetch(request, env) -> Response:
         return Response(DASHBOARD_HTML, headers={"Content-Type": "text/html; charset=utf-8"})
 
     if path == "/playlists" and method == "GET":
-        status, playlists, spotify_err, total, user_id = await list_playlists(env)
+        res = await list_playlists(env)
+        status = res["status"]
+        playlists = res["playlists"]
+        spotify_err = res["spotify_error"]
+        total = res["total"]
+        user_id = res["user_id"]
         if status != 200:
             granted: str = (await env.SPOTIFY_KV.get(KV_SCOPE)) or ""
             granted_set: Set[str] = set(granted.split()) if granted else set()
@@ -608,11 +631,15 @@ async def handle_fetch(request, env) -> Response:
                 "granted_scope": granted,
                 "missing_scope": missing,
                 "spotify_error": spotify_err,
+                "first_page_keys": res["first_page_keys"],
+                "first_page_raw": res["first_page_raw"],
             }, status=status)
         return json_response({
             "playlists": playlists,
             "total": total,
             "user_id": user_id or "",
+            "first_page_keys": res["first_page_keys"],
+            "first_page_raw": res["first_page_raw"],
         })
 
     if path == "/select" and method == "POST":
@@ -746,13 +773,43 @@ DASHBOARD_HTML: str = """<!doctype html>
       const userId = data.user_id || '';
       sel.innerHTML = '';
       if (lists.length === 0) {
+        hint.innerHTML = '';
+        const intro = document.createElement('div');
         if (total > 0) {
-          hint.textContent = 'Spotify 는 ' + total + '개의 플레이리스트가 있다고 하는데 응답에 항목이 없습니다.'
-            + ' user_id=' + userId + ' / Cloudflare 로그(observability)의 raw 응답을 확인하세요.';
+          intro.textContent = 'Spotify 는 ' + total + '개의 플레이리스트가 있다고 보고했지만 응답에 항목이 비어 있습니다. user_id=' + userId;
         } else {
-          hint.textContent = '플레이리스트가 0개입니다 (현재 계정 user_id=' + userId + ').'
-            + ' "Liked Songs"는 별도이며 이 목록에 포함되지 않습니다.'
-            + ' "새 플레이리스트 생성"으로 만들거나, 의도한 계정으로 /login 했는지 확인하세요.';
+          intro.textContent = '이 토큰의 Spotify 응답에 플레이리스트가 0개로 옵니다 (user_id=' + userId + ').'
+            + ' "Liked Songs"는 /me/playlists 에 포함되지 않습니다.';
+        }
+        hint.appendChild(intro);
+
+        if (userId) {
+          const linkLine = document.createElement('div');
+          linkLine.className = 'mt-1';
+          const a = document.createElement('a');
+          a.href = 'https://open.spotify.com/user/' + encodeURIComponent(userId);
+          a.target = '_blank';
+          a.rel = 'noopener';
+          a.textContent = 'open.spotify.com/user/' + userId;
+          linkLine.appendChild(document.createTextNode('이 user_id 의 Spotify 프로필 → '));
+          linkLine.appendChild(a);
+          linkLine.appendChild(document.createTextNode(' 에서 의도한 계정/플레이리스트가 보이는지 확인하세요.'));
+          hint.appendChild(linkLine);
+        }
+
+        if (data.first_page_raw) {
+          const details = document.createElement('details');
+          details.className = 'mt-2';
+          const summary = document.createElement('summary');
+          summary.textContent = 'Spotify 응답 raw 보기 (디버그)';
+          const pre = document.createElement('pre');
+          pre.className = 'mt-2 small';
+          pre.style.whiteSpace = 'pre-wrap';
+          pre.style.wordBreak = 'break-all';
+          pre.textContent = 'keys=' + ((data.first_page_keys || []).join(',')) + '\n\n' + data.first_page_raw;
+          details.appendChild(summary);
+          details.appendChild(pre);
+          hint.appendChild(details);
         }
         return;
       }
