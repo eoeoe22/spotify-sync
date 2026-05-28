@@ -88,8 +88,25 @@ async def http_request(
 
     resp = await fetch(url, to_js_obj(options))
     status: int = int(resp.status)
-    text: str = await resp.text()
-    data: Dict[str, Any] = json.loads(text) if text else {}
+    # pyodide 의 await resp.text() 는 JsProxy 래퍼를 돌려줄 수 있어 str() 로 명시 변환한다.
+    text: str = str(await resp.text() or "")
+    data: Dict[str, Any] = {}
+    if text.strip():
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                data = {"_raw": parsed}
+        except (ValueError, TypeError) as exc:
+            # 비-JSON 응답(HTML 오류 페이지, 빈 본문 등)을 만나도 호출자가 status 로 처리할 수 있게
+            # 예외를 삼키고 원본 텍스트를 _raw 에 담아 반환한다.
+            console.log(
+                "응답 JSON 파싱 실패 status=" + str(status)
+                + " url=" + url + " err=" + str(exc)
+                + " body=" + text[:500]
+            )
+            data = {"_raw": text[:1000]}
     return status, data
 
 
@@ -449,9 +466,19 @@ async def handle_callback(request, env) -> Response:
     }
     status, data = await http_request("POST", SPOTIFY_TOKEN_URL, form_body=form)
     if status != 200:
-        return Response("토큰 발급 실패: " + json.dumps(data), status=400)
+        console.log("토큰 발급 실패 status=" + str(status) + " body=" + json.dumps(data))
+        return Response(
+            "토큰 발급 실패 (status " + str(status) + "): " + json.dumps(data),
+            status=400,
+        )
 
-    access: str = data.get("access_token")
+    access: Optional[str] = data.get("access_token")
+    if not access:
+        console.log("토큰 발급 응답에 access_token 이 없음 body=" + json.dumps(data))
+        return Response(
+            "토큰 발급 응답이 올바르지 않습니다: " + json.dumps(data),
+            status=400,
+        )
     refresh: Optional[str] = data.get("refresh_token")
     granted_scope: str = data.get("scope") or ""
     console.log("토큰 발급 완료. 부여된 scope=" + granted_scope)
