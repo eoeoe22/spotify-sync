@@ -42,13 +42,18 @@ SPOTIFY_TOKEN_URL: str = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE: str = "https://api.spotify.com/v1"
 
 # 필요한 권한 (공식 문서 기준):
-#   user-library-read         → GET /me/tracks (좋아요 곡 읽기)
-#   playlist-read-private     → 비공개 플레이리스트 목록 조회
-#   playlist-modify-public    → 공개 플레이리스트 생성/수정
+#   user-library-read            → GET /me/tracks (좋아요 곡 읽기)
+#   playlist-read-private        → 비공개 플레이리스트 목록 조회
+#   playlist-read-collaborative  → 협업 플레이리스트 목록 조회
+#   playlist-modify-public       → 공개 플레이리스트 생성/수정
+#   playlist-modify-private      → 비공개/협업 플레이리스트 수정
+# 미러로 비공개·협업 플레이리스트를 선택해도 동작하도록 modify-private 도 요청한다.
 SCOPES: List[str] = [
     "user-library-read",
     "playlist-read-private",
+    "playlist-read-collaborative",
     "playlist-modify-public",
+    "playlist-modify-private",
 ]
 SCOPE_STR: str = " ".join(SCOPES)
 REQUIRED_SCOPES: Set[str] = set(SCOPES)
