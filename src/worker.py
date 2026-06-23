@@ -442,10 +442,9 @@ async def remove_tracks(env, playlist_id: str, uris: List[str]) -> bool:
     """플레이리스트에서 100개씩 청크로 트랙을 제거 (증분 동기화)."""
     for i in range(0, len(uris), CHUNK_SIZE):
         chunk = uris[i:i + CHUNK_SIZE]
-        # DELETE /playlists/{playlist_id}/tracks requires {"tracks": [{"uri": "..."}]}
         body = {"tracks": [{"uri": uri} for uri in chunk]}
         status, data = await spotify_api(
-            env, "DELETE", "/playlists/" + playlist_id + "/tracks",
+            env, "DELETE", "/playlists/" + playlist_id + "/items",
             json_body=body,
         )
         if status not in (200, 201):
