@@ -438,6 +438,22 @@ async def append_tracks(env, playlist_id: str, uris: List[str]) -> bool:
     return True
 
 
+async def remove_tracks(env, playlist_id: str, uris: List[str]) -> bool:
+    """플레이리스트에서 100개씩 청크로 트랙을 제거 (증분 동기화)."""
+    for i in range(0, len(uris), CHUNK_SIZE):
+        chunk = uris[i:i + CHUNK_SIZE]
+        # DELETE /playlists/{playlist_id}/tracks requires {"tracks": [{"uri": "..."}]}
+        body = {"tracks": [{"uri": uri} for uri in chunk]}
+        status, data = await spotify_api(
+            env, "DELETE", "/playlists/" + playlist_id + "/tracks",
+            json_body=body,
+        )
+        if status not in (200, 201):
+            console.log("트랙 제거 실패 status=" + str(status) + " body=" + json.dumps(data)[:300])
+            return False
+    return True
+
+
 # --- 메인 동기화 -----------------------------------------------------------
 
 async def sync_now(env) -> Dict[str, Any]:
@@ -456,12 +472,24 @@ async def sync_now(env) -> Dict[str, Any]:
         console.log("최초 동기화: 전체 교체")
         ok = await replace_playlist(env, playlist_id, liked)
         added = len(liked) if ok else 0
+        removed = 0
     else:
         existing = await fetch_playlist_uris(env, playlist_id)
         new_uris = [u for u in liked if u not in existing]
-        console.log("증분 동기화: 신규 " + str(len(new_uris)) + "개")
-        ok = await append_tracks(env, playlist_id, new_uris)
+        removed_uris = [u for u in existing if u not in liked]
+        console.log("증분 동기화: 신규 " + str(len(new_uris)) + "개, 제거 " + str(len(removed_uris)) + "개")
+
+        ok = True
+        if removed_uris:
+            ok_remove = await remove_tracks(env, playlist_id, removed_uris)
+            ok = ok and ok_remove
+
+        if new_uris:
+            ok_add = await append_tracks(env, playlist_id, new_uris)
+            ok = ok and ok_add
+
         added = len(new_uris) if ok else 0
+        removed = len(removed_uris) if ok else 0
 
     if not ok:
         return {"ok": False, "error": "Spotify API 호출 실패"}
@@ -469,8 +497,8 @@ async def sync_now(env) -> Dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat()
     await env.SPOTIFY_KV.put(KV_LAST_TIME, now)
     await env.SPOTIFY_KV.put(KV_LAST_COUNT, str(len(liked)))
-    console.log("동기화 완료 time=" + now + " total=" + str(len(liked)) + " added=" + str(added))
-    return {"ok": True, "last_sync": now, "track_count": len(liked), "added": added}
+    console.log("동기화 완료 time=" + now + " total=" + str(len(liked)) + " added=" + str(added) + " removed=" + str(removed))
+    return {"ok": True, "last_sync": now, "track_count": len(liked), "added": added, "removed": removed}
 
 
 # --- 라우트 핸들러 ---------------------------------------------------------
@@ -808,7 +836,7 @@ DASHBOARD_HTML: str = """<!doctype html>
       btn.textContent = '동기화 중...';
       try {
         const r = await (await fetch('/sync', { method: 'POST' })).json();
-        if (r.ok) alert('완료: 총 ' + r.track_count + '곡 (신규 ' + r.added + '곡)');
+        if (r.ok) alert('완료: 총 ' + r.track_count + '곡 (신규 ' + r.added + '곡, 제거 ' + (r.removed || 0) + '곡)');
         else alert('실패: ' + (r.error || '알 수 없는 오류'));
       } finally {
         btn.disabled = false;
