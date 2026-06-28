@@ -12,6 +12,7 @@ Spotify Web API 공식 문서를 기준으로 처음부터 다시 작성한 구�
   POST /select    → 미러 플레이리스트 선택 (Access 보호)
   POST /create    → 새 미러 플레이리스트 생성 (Access 보호)
   POST /sync      → 수동 동기화 (Access 보호)
+  GET  /extract   → 좋아요(원본) 곡 텍스트 추출 (Access 보호)
   scheduled cron  → 매일 자동 동기화
 
 참고:
@@ -281,6 +282,34 @@ async def fetch_liked_uris(env) -> List[str]:
         url = data.get("next")
     console.log("좋아요 곡 " + str(len(uris)) + "개 수집")
     return uris
+
+
+async def fetch_liked_tracks(env) -> List[Dict[str, str]]:
+    """GET /me/tracks 를 페이지네이션으로 돌며 좋아요 곡의 제목/아티스트 수집.
+
+    텍스트 추출용. 미러 플레이리스트가 아니라 좋아요(원본) 곡 기준이다.
+    한 곡에 아티스트가 여러 명이면 ", " 로 이어 붙인다.
+    """
+    tracks: List[Dict[str, str]] = []
+    url: Optional[str] = "/me/tracks?limit=50"
+    while url:
+        status, data = await spotify_api(env, "GET", url)
+        if status != 200:
+            console.log("좋아요 곡 조회 실패 status=" + str(status))
+            break
+        for item in data.get("items", []) or []:
+            track = item.get("track") if isinstance(item, dict) else None
+            if not isinstance(track, dict):
+                continue
+            title = track.get("name")
+            if not title:
+                continue
+            artists = track.get("artists") or []
+            names = [a.get("name") for a in artists if isinstance(a, dict) and a.get("name")]
+            tracks.append({"title": str(title), "artist": ", ".join(names)})
+        url = data.get("next")
+    console.log("좋아요 곡 메타 " + str(len(tracks)) + "개 수집")
+    return tracks
 
 
 async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
@@ -666,6 +695,21 @@ async def handle_sync(env) -> Response:
     return json_response(result, status=200 if result.get("ok") else 400)
 
 
+async def handle_extract(env) -> Response:
+    """좋아요(원본) 곡을 제목/아티스트 목록으로 추출.
+
+    형식 변환(기본 텍스트 / 마크다운 표)은 대시보드에서 처리하도록
+    여기서는 구조화된 데이터만 돌려준다.
+    """
+    if not await get_token(env):
+        return json_response(
+            {"ok": False, "error": "Spotify 인증 정보가 없습니다. /login 으로 다시 연동하세요."},
+            status=400,
+        )
+    tracks = await fetch_liked_tracks(env)
+    return json_response({"ok": True, "tracks": tracks, "count": len(tracks)})
+
+
 # --- 라우터 ----------------------------------------------------------------
 
 async def handle_fetch(request, env) -> Response:
@@ -699,6 +743,8 @@ async def handle_fetch(request, env) -> Response:
         return await handle_create(request, env)
     if path == "/sync" and method == "POST":
         return await handle_sync(env)
+    if path == "/extract" and method == "GET":
+        return await handle_extract(env)
 
     return Response("404 Not Found", status=404)
 
@@ -742,9 +788,26 @@ DASHBOARD_HTML: str = """<!doctype html>
       </div>
     </div>
 
-    <div class="d-flex gap-2">
+    <div class="d-flex gap-2 mb-3">
       <a class="btn btn-success" href="/login">Spotify 연동</a>
       <button id="syncBtn" class="btn btn-primary" onclick="doSync()">지금 동기화</button>
+    </div>
+
+    <div class="card mb-3">
+      <div class="card-body">
+        <h5 class="card-title">텍스트 추출</h5>
+        <p class="text-muted small mb-2">좋아요(원본) 곡 목록을 텍스트로 추출합니다. (미러 플레이리스트가 아님)</p>
+        <div class="d-flex gap-2 align-items-center flex-wrap mb-2">
+          <button id="extractBtn" class="btn btn-outline-primary" onclick="doExtract()">텍스트 추출</button>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" id="mdTable" onchange="renderExtract()">
+            <label class="form-check-label" for="mdTable">마크다운 표로 변환</label>
+          </div>
+          <button id="copyBtn" class="btn btn-outline-secondary" onclick="copyExtract()" style="display:none;">복사</button>
+          <small id="extractCount" class="text-muted"></small>
+        </div>
+        <textarea id="extractOut" class="form-control font-monospace" rows="10" readonly placeholder="추출된 목록이 여기에 표시됩니다." style="display:none;"></textarea>
+      </div>
     </div>
   </div>
 
@@ -842,6 +905,72 @@ DASHBOARD_HTML: str = """<!doctype html>
         btn.textContent = '지금 동기화';
         loadStatus();
       }
+    }
+
+    let extractedTracks = null;
+
+    async function doExtract() {
+      const btn = document.getElementById('extractBtn');
+      const count = document.getElementById('extractCount');
+      btn.disabled = true;
+      btn.textContent = '추출 중...';
+      count.textContent = '';
+      try {
+        const res = await fetch('/extract');
+        let data = {};
+        try { data = await res.json(); } catch (e) {}
+        if (!res.ok || !data.ok) {
+          alert('추출 실패: ' + (data.error || ('HTTP ' + res.status)));
+          return;
+        }
+        extractedTracks = data.tracks || [];
+        renderExtract();
+      } catch (e) {
+        alert('요청 오류: ' + e);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = '텍스트 추출';
+      }
+    }
+
+    function mdEscape(s) {
+      return String(s == null ? '' : s).replace(/\\|/g, '\\\\|');
+    }
+
+    function renderExtract() {
+      const out = document.getElementById('extractOut');
+      const copyBtn = document.getElementById('copyBtn');
+      const count = document.getElementById('extractCount');
+      if (!extractedTracks) return;
+      const asTable = document.getElementById('mdTable').checked;
+      let text;
+      if (asTable) {
+        const rows = ['| 제목 | 아티스트 |', '| --- | --- |'];
+        extractedTracks.forEach(t => {
+          rows.push('| ' + mdEscape(t.title) + ' | ' + mdEscape(t.artist) + ' |');
+        });
+        text = rows.join('\\n');
+      } else {
+        text = extractedTracks.map(t => (t.title || '') + ' | ' + (t.artist || '')).join('\\n');
+      }
+      out.value = text;
+      out.style.display = 'block';
+      copyBtn.style.display = 'inline-block';
+      count.textContent = extractedTracks.length + '곡';
+    }
+
+    async function copyExtract() {
+      const out = document.getElementById('extractOut');
+      try {
+        await navigator.clipboard.writeText(out.value);
+      } catch (e) {
+        out.select();
+        document.execCommand('copy');
+      }
+      const btn = document.getElementById('copyBtn');
+      const prev = btn.textContent;
+      btn.textContent = '복사됨!';
+      setTimeout(() => { btn.textContent = prev; }, 1200);
     }
 
     window.addEventListener('DOMContentLoaded', loadStatus);
