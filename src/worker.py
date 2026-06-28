@@ -284,11 +284,16 @@ async def fetch_liked_uris(env) -> List[str]:
     return uris
 
 
-async def fetch_liked_tracks(env) -> List[Dict[str, str]]:
+async def fetch_liked_tracks(env) -> Tuple[List[Dict[str, str]], Optional[int]]:
     """GET /me/tracks 를 페이지네이션으로 돌며 좋아요 곡의 제목/아티스트 수집.
 
     텍스트 추출용. 미러 플레이리스트가 아니라 좋아요(원본) 곡 기준이다.
     한 곡에 아티스트가 여러 명이면 ", " 로 이어 붙인다.
+
+    반환값: (tracks, error_status). 모든 페이지를 성공적으로 읽으면
+    error_status 는 None 이고, 어느 페이지에서든 non-200 이 나오면 부분
+    결과를 조용히 반환하지 않고 그 status 를 함께 돌려준다. (호출자가
+    불완전한 추출을 성공으로 오인하지 않도록.)
     """
     tracks: List[Dict[str, str]] = []
     url: Optional[str] = "/me/tracks?limit=50"
@@ -296,7 +301,7 @@ async def fetch_liked_tracks(env) -> List[Dict[str, str]]:
         status, data = await spotify_api(env, "GET", url)
         if status != 200:
             console.log("좋아요 곡 조회 실패 status=" + str(status))
-            break
+            return tracks, status
         for item in data.get("items", []) or []:
             track = item.get("track") if isinstance(item, dict) else None
             if not isinstance(track, dict):
@@ -309,7 +314,7 @@ async def fetch_liked_tracks(env) -> List[Dict[str, str]]:
             tracks.append({"title": str(title), "artist": ", ".join(names)})
         url = data.get("next")
     console.log("좋아요 곡 메타 " + str(len(tracks)) + "개 수집")
-    return tracks
+    return tracks, None
 
 
 async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
@@ -706,7 +711,16 @@ async def handle_extract(env) -> Response:
             {"ok": False, "error": "Spotify 인증 정보가 없습니다. /login 으로 다시 연동하세요."},
             status=400,
         )
-    tracks = await fetch_liked_tracks(env)
+    tracks, err = await fetch_liked_tracks(env)
+    if err is not None:
+        msg = "좋아요 곡 조회 실패 (status " + str(err) + ")."
+        if err == 403:
+            msg += " scope 부족이거나 앱이 Development Mode 인지 확인하세요."
+        elif err == 429:
+            msg += " 요청이 많아 일시적으로 제한되었습니다. 잠시 후 다시 시도하세요."
+        # 부분 결과를 성공으로 내보내지 않는다. 5xx 는 502, 그 외엔 status 그대로.
+        http_status = 502 if err >= 500 else err
+        return json_response({"ok": False, "error": msg}, status=http_status)
     return json_response({"ok": True, "tracks": tracks, "count": len(tracks)})
 
 
