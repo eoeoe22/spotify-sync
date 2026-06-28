@@ -32,6 +32,7 @@ spotify-sync/
 | `/select` | POST | Access | 미러 플레이리스트 선택 `{playlist_id}` |
 | `/create` | POST | Access | 새 미러 플레이리스트 생성 `{name}` |
 | `/sync` | POST | Access | 수동 동기화 트리거 |
+| `/extract` | GET | Access | 좋아요(원본) 곡 목록 JSON `{ok, tracks:[{title, artist}], count}` |
 | (cron) | scheduled | - | 매일 자동 동기화 |
 
 > Access 보호 경로는 `CF-Access-Jwt-Assertion` 헤더가 없으면 `403` 을 반환합니다.
