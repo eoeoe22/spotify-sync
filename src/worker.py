@@ -85,6 +85,17 @@ def to_js_obj(obj: Any) -> Any:
     return _to_js(obj, dict_converter=Object.fromEntries)
 
 
+def _dedupe_preserve_order(uris: List[str]) -> List[str]:
+    """등장 순서를 유지하면서 중복 URI 를 한 번만 남긴다."""
+    seen: Set[str] = set()
+    out: List[str] = []
+    for u in uris:
+        if u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
+
+
 def origin_of(request) -> str:
     """요청 URL 에서 'scheme://host' 만 잘라낸다."""
     p = urlparse(request.url)
@@ -317,14 +328,18 @@ async def fetch_liked_tracks(env) -> Tuple[List[Dict[str, str]], Optional[int]]:
     return tracks, None
 
 
-async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
-    """대상 플레이리스트의 모든 트랙 URI 집합.
+async def fetch_playlist_uris(env, playlist_id: str) -> List[str]:
+    """대상 플레이리스트의 모든 트랙 URI 를 등장 순서대로(중복 포함) 반환.
+
+    중복 여부까지 파악해야 미러가 원본보다 곡 수가 많아지는(중복 누적)
+    문제를 바로잡을 수 있으므로, 집합이 아니라 리스트로 돌려준다.
+    호출부에서 필요하면 set(...) 으로 감싼다.
 
     2026 마이그레이션:
       - 엔드포인트: /playlists/{id}/items
       - 응답: items[].item (이전: items[].track) — 구버전 응답도 폴백
     """
-    existing: Set[str] = set()
+    existing: List[str] = []
     url: Optional[str] = "/playlists/" + playlist_id + "/items?limit=100"
     while url:
         status, data = await spotify_api(env, "GET", url)
@@ -334,7 +349,7 @@ async def fetch_playlist_uris(env, playlist_id: str) -> Set[str]:
         for it in data.get("items", []) or []:
             entry = it.get("item") or it.get("track") if isinstance(it, dict) else None
             if isinstance(entry, dict) and entry.get("uri"):
-                existing.add(entry["uri"])
+                existing.append(entry["uri"])
         url = data.get("next")
     return existing
 
@@ -498,7 +513,11 @@ async def sync_now(env) -> Dict[str, Any]:
     if not await get_token(env):
         return {"ok": False, "error": "Spotify 인증 정보가 없습니다. /login 으로 다시 연동하세요."}
 
-    liked = await fetch_liked_uris(env)
+    # 좋아요 목록은 중복이 없어야 정상이지만, 페이지네이션 중 라이브러리가
+    # 바뀌는 등으로 같은 URI 가 두 번 잡히면 미러에 중복이 들어가므로
+    # 순서를 지키며 한 번 걸러낸다.
+    liked = _dedupe_preserve_order(await fetch_liked_uris(env))
+    liked_set: Set[str] = set(liked)
     last_sync: Optional[str] = await env.SPOTIFY_KV.get(KV_LAST_TIME)
 
     if not last_sync:
@@ -507,22 +526,43 @@ async def sync_now(env) -> Dict[str, Any]:
         added = len(liked) if ok else 0
         removed = 0
     else:
-        existing = await fetch_playlist_uris(env, playlist_id)
-        new_uris = [u for u in liked if u not in existing]
-        removed_uris = [u for u in existing if u not in liked]
-        console.log("증분 동기화: 신규 " + str(len(new_uris)) + "개, 제거 " + str(len(removed_uris)) + "개")
+        # 미러의 실제 항목을 중복까지 포함해 읽는다. Set 으로 비교하면
+        # 여전히 좋아요인 곡의 중복 복사본을 감지·삭제하지 못해 미러 곡 수가
+        # 원본보다 커진 채로 영원히 수렴하지 않는다.
+        existing_list = await fetch_playlist_uris(env, playlist_id)
+        existing_set: Set[str] = set(existing_list)
+
+        # 좋아요에서 빠진 곡(미러에만 있는 곡) → 모든 복사본 삭제
+        stale_uris = [u for u in existing_set if u not in liked_set]
+        # 미러에 아직 없는 좋아요 곡 → 추가
+        new_uris = [u for u in liked if u not in existing_set]
+
+        # 여전히 좋아요이지만 미러에 2번 이상 담긴 곡:
+        # DELETE 는 URI 의 모든 복사본을 지우므로, 전부 지운 뒤 하나만 다시 넣어
+        # 정확히 1개로 맞춘다.
+        counts: Dict[str, int] = {}
+        for u in existing_list:
+            counts[u] = counts.get(u, 0) + 1
+        dup_uris = [u for u, c in counts.items() if c > 1 and u in liked_set]
+
+        remove_uris = stale_uris + dup_uris
+        add_uris = new_uris + dup_uris
+        console.log(
+            "증분 동기화: 신규 " + str(len(new_uris)) + "개, 제거 " + str(len(stale_uris))
+            + "개, 중복정리 " + str(len(dup_uris)) + "개"
+        )
 
         ok = True
-        if removed_uris:
-            ok_remove = await remove_tracks(env, playlist_id, removed_uris)
+        if remove_uris:
+            ok_remove = await remove_tracks(env, playlist_id, remove_uris)
             ok = ok and ok_remove
 
-        if new_uris:
-            ok_add = await append_tracks(env, playlist_id, new_uris)
+        if add_uris:
+            ok_add = await append_tracks(env, playlist_id, add_uris)
             ok = ok and ok_add
 
         added = len(new_uris) if ok else 0
-        removed = len(removed_uris) if ok else 0
+        removed = len(stale_uris) if ok else 0
 
     if not ok:
         return {"ok": False, "error": "Spotify API 호출 실패"}
